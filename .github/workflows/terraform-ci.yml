@@ -1,0 +1,123 @@
+name: "Terraform CI (Reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Directory containing Terraform files"
+        required: true
+        type: string
+      terraform_version:
+        description: "Terraform version"
+        required: false
+        type: string
+        default: "latest"
+      action:
+        description: "Terraform action: plan or apply"
+        required: true
+        type: string
+      backend_bucket:
+        description: "S3 bucket for Terraform state"
+        required: true
+        type: string
+      backend_key:
+        description: "S3 key for Terraform state file"
+        required: true
+        type: string
+      backend_region:
+        description: "S3 bucket region"
+        required: true
+        type: string
+      var_file:
+        description: "Path to .tfvars file (relative to working_directory)"
+        required: false
+        type: string
+      aws_region:
+        description: "AWS region for provider"
+        required: true
+        type: string
+      environment:
+        description: "GitHub environment for approvals"
+        required: false
+        type: string
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      JETPACK_APP_ID:
+        required: false
+      JETPACK_APP_PRIVATE_KEY:
+        required: false
+
+jobs:
+  terraform:
+    name: "Terraform (${{ inputs.action }})"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🔑 Generate token for private TF modules"
+        if: ${{ secrets.JETPACK_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        id: tf-modules-token
+        with:
+          app-id: ${{ secrets.JETPACK_APP_ID }}
+          private-key: ${{ secrets.JETPACK_APP_PRIVATE_KEY }}
+          owner: getjetpack
+          repositories: jetpack-tf-modules
+
+      - name: "🔑 Configure git for private TF modules"
+        if: steps.tf-modules-token.outputs.token
+        run: git config --global url."https://x-access-token:${{ steps.tf-modules-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: "⚙️ Setup Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: "📋 Terraform Init"
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ inputs.backend_bucket }}" \
+            -backend-config="key=${{ inputs.backend_key }}" \
+            -backend-config="region=${{ inputs.backend_region }}"
+
+      - name: "✅ Terraform Validate"
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform validate
+
+      - name: "🔍 Terraform Format Check"
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: "📋 Terraform Plan"
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          PLAN_ARGS=""
+          if [ -n "${{ inputs.var_file }}" ]; then
+            PLAN_ARGS="-var-file=${{ inputs.var_file }}"
+          fi
+          terraform plan $PLAN_ARGS -out=tfplan
+
+      - name: "📊 Plan Summary"
+        if: always()
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          if [ -f tfplan ]; then
+            terraform show -no-color tfplan | tail -20
+          fi
+
+      - name: "🚀 Terraform Apply"
+        if: inputs.action == 'apply'
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform apply -auto-approve tfplan
