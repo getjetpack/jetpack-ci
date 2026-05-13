@@ -59,13 +59,14 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
+      HAS_APP_ID: ${{ secrets.JETPACK_APP_ID }}
 
     steps:
       - name: "📥 Checkout"
         uses: actions/checkout@v4
 
       - name: "🔑 Generate token for private TF modules"
-        if: ${{ secrets.JETPACK_APP_ID != '' }}
+        if: env.HAS_APP_ID != ''
         uses: actions/create-github-app-token@v1
         id: tf-modules-token
         with:
@@ -75,7 +76,7 @@ jobs:
           repositories: jetpack-tf-modules
 
       - name: "🔑 Configure git for private TF modules"
-        if: steps.tf-modules-token.outputs.token
+        if: steps.tf-modules-token.outputs.token != ''
         run: git config --global url."https://x-access-token:${{ steps.tf-modules-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
 
       - name: "⚙️ Setup Terraform"
@@ -118,6 +119,6 @@ jobs:
           fi
 
       - name: "🚀 Terraform Apply"
-        if: inputs.action == 'apply'
+        if: ${{ inputs.action == 'apply' }}
         working-directory: ${{ inputs.working_directory }}
         run: terraform apply -auto-approve tfplan
