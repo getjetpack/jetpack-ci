@@ -164,6 +164,9 @@ jobs:
           name: tf-working-dir
           path: ${{ inputs.working_directory }}
 
+      - name: "🔧 Restore provider permissions"
+        run: find ${{ inputs.working_directory }}/.terraform -name 'terraform-provider-*' -exec chmod +x {} +
+
       - name: "✅ Terraform Validate"
         id: validate
         working-directory: ${{ inputs.working_directory }}
@@ -257,6 +260,9 @@ jobs:
         with:
           name: tf-working-dir
           path: ${{ inputs.working_directory }}
+
+      - name: "🔧 Restore provider permissions"
+        run: find ${{ inputs.working_directory }}/.terraform -name 'terraform-provider-*' -exec chmod +x {} +
 
       - name: "🔑 Generate token for private TF modules"
         if: env.HAS_APP_ID != ''
@@ -407,6 +413,9 @@ jobs:
         with:
           name: tfplan
           path: ${{ inputs.working_directory }}
+
+      - name: "🔧 Restore provider permissions"
+        run: find ${{ inputs.working_directory }}/.terraform -name 'terraform-provider-*' -exec chmod +x {} +
 
       - name: "🔑 Generate token for private TF modules"
         if: env.HAS_APP_ID != ''
