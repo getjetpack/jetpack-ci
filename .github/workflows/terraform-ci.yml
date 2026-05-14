@@ -156,6 +156,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
 
       - name: "📥 Restore working directory"
         uses: actions/download-artifact@v4
@@ -167,17 +168,16 @@ jobs:
         id: validate
         working-directory: ${{ inputs.working_directory }}
         run: |
-          OUTPUT=$(terraform validate -json 2>&1)
-          echo "$OUTPUT" | jq .
-          VALID=$(echo "$OUTPUT" | jq -r '.valid')
-          ERROR_COUNT=$(echo "$OUTPUT" | jq '.diagnostics | map(select(.severity == "error")) | length')
-          WARNING_COUNT=$(echo "$OUTPUT" | jq '.diagnostics | map(select(.severity == "warning")) | length')
-          echo "valid=$VALID" >> "$GITHUB_OUTPUT"
-          echo "errors=$ERROR_COUNT" >> "$GITHUB_OUTPUT"
-          echo "warnings=$WARNING_COUNT" >> "$GITHUB_OUTPUT"
-          if [ "$VALID" != "true" ]; then
-            echo "::error::Terraform validation failed"
-            echo "$OUTPUT" | jq -r '.diagnostics[] | "::error file=\(.range.filename // "unknown"),line=\(.range.start.line // 0)::\(.severity): \(.summary) — \(.detail // "no details")"'
+          if terraform validate -no-color > /tmp/validate-output.txt 2>&1; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            echo "errors=0" >> "$GITHUB_OUTPUT"
+            echo "warnings=0" >> "$GITHUB_OUTPUT"
+            cat /tmp/validate-output.txt
+          else
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            echo "errors=1" >> "$GITHUB_OUTPUT"
+            echo "warnings=0" >> "$GITHUB_OUTPUT"
+            cat /tmp/validate-output.txt
             exit 1
           fi
 
@@ -218,82 +218,22 @@ jobs:
             echo "</details>" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  # ── 2b. Scan (tfsec / trivy) ───────────────────────────────────────────────
+  # ── 2b. Scan (placeholder — will be implemented) ────────────────────────────
   scan:
     name: "Scan"
     needs: init
     runs-on: ubuntu-latest
     steps:
-      - name: "📥 Checkout"
-        uses: actions/checkout@v4
-
-      - name: "🔒 Run Trivy (Terraform)"
-        id: trivy
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: config
-          scan-ref: ${{ inputs.working_directory }}
-          format: json
-          output: trivy-results.json
-          exit-code: "0"
-          severity: "CRITICAL,HIGH,MEDIUM"
+      - name: "🔒 Security Scan (coming soon)"
+        run: echo "Security scanning will be implemented in a future release."
 
       - name: "📝 Scan Summary"
-        if: always()
         run: |
-          if [ ! -f trivy-results.json ]; then
-            echo "## 🔒 Security Scan" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "⚠️ Trivy scan produced no output" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          CRITICAL=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "CRITICAL")] | length' trivy-results.json 2>/dev/null || echo 0)
-          HIGH=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "HIGH")] | length' trivy-results.json 2>/dev/null || echo 0)
-          MEDIUM=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "MEDIUM")] | length' trivy-results.json 2>/dev/null || echo 0)
-          TOTAL=$((CRITICAL + HIGH + MEDIUM))
-
-          if [ "$TOTAL" -eq 0 ]; then
-            SCAN_ICON="✅"
-            SCAN_STATUS="No issues found"
-          elif [ "$CRITICAL" -gt 0 ]; then
-            SCAN_ICON="🚨"
-            SCAN_STATUS="Critical issues detected"
-          elif [ "$HIGH" -gt 0 ]; then
-            SCAN_ICON="⚠️"
-            SCAN_STATUS="High severity issues detected"
-          else
-            SCAN_ICON="📋"
-            SCAN_STATUS="Medium severity issues detected"
-          fi
-
-          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+          cat >> "$GITHUB_STEP_SUMMARY" << 'SUMMARY'
           ## 🔒 Security Scan
 
-          ${SCAN_ICON} **${SCAN_STATUS}**
-
-          | Severity | Count |
-          |----------|-------|
-          | 🔴 Critical | ${CRITICAL} |
-          | 🟠 High | ${HIGH} |
-          | 🟡 Medium | ${MEDIUM} |
+          ⏳ **Coming soon** — Trivy / tfsec integration will be added in a future release.
           SUMMARY
-
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "<details><summary>Findings</summary>" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Severity | ID | Title | File |" >> "$GITHUB_STEP_SUMMARY"
-            echo "|----------|----|-------|------|" >> "$GITHUB_STEP_SUMMARY"
-            jq -r '
-              [.Results[]?.Misconfigurations[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH" or .Severity == "MEDIUM")]
-              | sort_by(if .Severity == "CRITICAL" then 0 elif .Severity == "HIGH" then 1 else 2 end)
-              | .[]
-              | "| \(if .Severity == "CRITICAL" then "🔴" elif .Severity == "HIGH" then "🟠" else "🟡" end) \(.Severity) | `\(.ID)` | \(.Title) | `\(.CauseMetadata.Resource // .Target // "—")` |"
-            ' trivy-results.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
-          fi
 
   # ── 3. Plan ────────────────────────────────────────────────────────────────
   plan:
