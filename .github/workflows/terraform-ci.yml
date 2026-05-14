@@ -50,17 +50,20 @@ on:
       JETPACK_APP_PRIVATE_KEY:
         required: false
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Jobs: Init → Validate + Scan (parallel) → Plan → Apply
+# ─────────────────────────────────────────────────────────────────────────────
+
 jobs:
-  terraform:
-    name: "Terraform (${{ inputs.action }})"
+  # ── 1. Init ────────────────────────────────────────────────────────────────
+  init:
+    name: "Init"
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
       HAS_APP_ID: ${{ secrets.JETPACK_APP_ID }}
-
     steps:
       - name: "📥 Checkout"
         uses: actions/checkout@v4
@@ -82,10 +85,11 @@ jobs:
             aws s3api put-public-access-block \
               --bucket "${{ inputs.backend_bucket }}" \
               --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
-            echo "✅ Bucket created with versioning, encryption, and public access blocked"
+            BUCKET_STATUS="created"
           else
-            echo "✅ Bucket already exists"
+            BUCKET_STATUS="exists"
           fi
+          echo "BUCKET_STATUS=$BUCKET_STATUS" >> "$GITHUB_ENV"
 
       - name: "🔑 Generate token for private TF modules"
         if: env.HAS_APP_ID != ''
@@ -106,7 +110,7 @@ jobs:
         with:
           terraform_version: ${{ inputs.terraform_version }}
 
-      - name: "📋 Terraform Init"
+      - name: "📦 Terraform Init"
         working-directory: ${{ inputs.working_directory }}
         run: |
           terraform init \
@@ -114,33 +118,417 @@ jobs:
             -backend-config="key=${{ inputs.backend_key }}" \
             -backend-config="region=${{ inputs.backend_region }}"
 
-      - name: "✅ Terraform Validate"
-        working-directory: ${{ inputs.working_directory }}
-        run: terraform validate
+      - name: "📤 Cache initialized working directory"
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-working-dir
+          path: ${{ inputs.working_directory }}
+          include-hidden-files: true
+          retention-days: 1
 
-      - name: "🔍 Terraform Format Check"
+      - name: "📝 Init Summary"
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'SUMMARY'
+          ## 📦 Terraform Init
+
+          | Setting | Value |
+          |---------|-------|
+          | **Directory** | `${{ inputs.working_directory }}` |
+          | **Backend** | `s3://${{ inputs.backend_bucket }}/${{ inputs.backend_key }}` |
+          | **Region** | `${{ inputs.aws_region }}` |
+          | **Terraform** | `${{ inputs.terraform_version }}` |
+          SUMMARY
+
+          if [ "$BUCKET_STATUS" = "created" ]; then
+            echo "| **State Bucket** | 🆕 Created with versioning + encryption |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| **State Bucket** | ✅ Already exists |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ── 2a. Validate (terraform validate + fmt) ─────────────────────────────────
+  validate:
+    name: "Validate"
+    needs: init
+    runs-on: ubuntu-latest
+    steps:
+      - name: "⚙️ Setup Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: "📥 Restore working directory"
+        uses: actions/download-artifact@v4
+        with:
+          name: tf-working-dir
+          path: ${{ inputs.working_directory }}
+
+      - name: "✅ Terraform Validate"
+        id: validate
         working-directory: ${{ inputs.working_directory }}
-        run: terraform fmt -check -recursive
-        continue-on-error: true
+        run: |
+          OUTPUT=$(terraform validate -json 2>&1)
+          echo "$OUTPUT" | jq .
+          VALID=$(echo "$OUTPUT" | jq -r '.valid')
+          ERROR_COUNT=$(echo "$OUTPUT" | jq '.diagnostics | map(select(.severity == "error")) | length')
+          WARNING_COUNT=$(echo "$OUTPUT" | jq '.diagnostics | map(select(.severity == "warning")) | length')
+          echo "valid=$VALID" >> "$GITHUB_OUTPUT"
+          echo "errors=$ERROR_COUNT" >> "$GITHUB_OUTPUT"
+          echo "warnings=$WARNING_COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$VALID" != "true" ]; then
+            echo "::error::Terraform validation failed"
+            echo "$OUTPUT" | jq -r '.diagnostics[] | "::error file=\(.range.filename // "unknown"),line=\(.range.start.line // 0)::\(.severity): \(.summary) — \(.detail // "no details")"'
+            exit 1
+          fi
+
+      - name: "🎨 Terraform Format Check"
+        id: fmt
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          if terraform fmt -check -recursive -diff > /tmp/fmt-diff.txt 2>&1; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=drift" >> "$GITHUB_OUTPUT"
+            echo "::warning::Terraform formatting drift detected — run 'terraform fmt -recursive'"
+          fi
+
+      - name: "📝 Validate Summary"
+        if: always()
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          VALIDATE_ICON=$( [ "${{ steps.validate.outputs.valid }}" = "true" ] && echo "✅" || echo "❌" )
+          FMT_ICON=$( [ "${{ steps.fmt.outputs.status }}" = "pass" ] && echo "✅" || echo "⚠️" )
+
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+          ## ✅ Terraform Validate
+
+          | Check | Status | Details |
+          |-------|--------|---------|
+          | **Validate** | ${VALIDATE_ICON} | ${{ steps.validate.outputs.errors }} errors, ${{ steps.validate.outputs.warnings }} warnings |
+          | **Format** | ${FMT_ICON} | ${{ steps.fmt.outputs.status == 'pass' && 'All files formatted' || 'Drift detected — run `terraform fmt`' }} |
+          SUMMARY
+
+          if [ "${{ steps.fmt.outputs.status }}" != "pass" ] && [ -s /tmp/fmt-diff.txt ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "<details><summary>Format diff</summary>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```diff' >> "$GITHUB_STEP_SUMMARY"
+            head -100 /tmp/fmt-diff.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ── 2b. Scan (tfsec / trivy) ───────────────────────────────────────────────
+  scan:
+    name: "Scan"
+    needs: init
+    runs-on: ubuntu-latest
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🔒 Run Trivy (Terraform)"
+        id: trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.working_directory }}
+          format: json
+          output: trivy-results.json
+          exit-code: "0"
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+      - name: "📝 Scan Summary"
+        if: always()
+        run: |
+          if [ ! -f trivy-results.json ]; then
+            echo "## 🔒 Security Scan" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠️ Trivy scan produced no output" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          CRITICAL=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "CRITICAL")] | length' trivy-results.json 2>/dev/null || echo 0)
+          HIGH=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "HIGH")] | length' trivy-results.json 2>/dev/null || echo 0)
+          MEDIUM=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "MEDIUM")] | length' trivy-results.json 2>/dev/null || echo 0)
+          TOTAL=$((CRITICAL + HIGH + MEDIUM))
+
+          if [ "$TOTAL" -eq 0 ]; then
+            SCAN_ICON="✅"
+            SCAN_STATUS="No issues found"
+          elif [ "$CRITICAL" -gt 0 ]; then
+            SCAN_ICON="🚨"
+            SCAN_STATUS="Critical issues detected"
+          elif [ "$HIGH" -gt 0 ]; then
+            SCAN_ICON="⚠️"
+            SCAN_STATUS="High severity issues detected"
+          else
+            SCAN_ICON="📋"
+            SCAN_STATUS="Medium severity issues detected"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+          ## 🔒 Security Scan
+
+          ${SCAN_ICON} **${SCAN_STATUS}**
+
+          | Severity | Count |
+          |----------|-------|
+          | 🔴 Critical | ${CRITICAL} |
+          | 🟠 High | ${HIGH} |
+          | 🟡 Medium | ${MEDIUM} |
+          SUMMARY
+
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "<details><summary>Findings</summary>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Severity | ID | Title | File |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|----------|----|-------|------|" >> "$GITHUB_STEP_SUMMARY"
+            jq -r '
+              [.Results[]?.Misconfigurations[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH" or .Severity == "MEDIUM")]
+              | sort_by(if .Severity == "CRITICAL" then 0 elif .Severity == "HIGH" then 1 else 2 end)
+              | .[]
+              | "| \(if .Severity == "CRITICAL" then "🔴" elif .Severity == "HIGH" then "🟠" else "🟡" end) \(.Severity) | `\(.ID)` | \(.Title) | `\(.CauseMetadata.Resource // .Target // "—")` |"
+            ' trivy-results.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ── 3. Plan ────────────────────────────────────────────────────────────────
+  plan:
+    name: "Plan"
+    needs: [validate, scan]
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
+      HAS_APP_ID: ${{ secrets.JETPACK_APP_ID }}
+    steps:
+      - name: "⚙️ Setup Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: "📥 Restore working directory"
+        uses: actions/download-artifact@v4
+        with:
+          name: tf-working-dir
+          path: ${{ inputs.working_directory }}
+
+      - name: "🔑 Generate token for private TF modules"
+        if: env.HAS_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        id: tf-modules-token
+        with:
+          app-id: ${{ secrets.JETPACK_APP_ID }}
+          private-key: ${{ secrets.JETPACK_APP_PRIVATE_KEY }}
+          owner: getjetpack
+          repositories: jetpack-tf-modules
+
+      - name: "🔑 Configure git for private TF modules"
+        if: steps.tf-modules-token.outputs.token != ''
+        run: git config --global url."https://x-access-token:${{ steps.tf-modules-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
 
       - name: "📋 Terraform Plan"
+        id: plan
         working-directory: ${{ inputs.working_directory }}
         run: |
           PLAN_ARGS=""
           if [ -n "${{ inputs.var_file }}" ]; then
             PLAN_ARGS="-var-file=${{ inputs.var_file }}"
           fi
-          terraform plan $PLAN_ARGS -out=tfplan
+          terraform plan $PLAN_ARGS -out=tfplan -detailed-exitcode -no-color 2>&1 | tee /tmp/plan-output.txt || PLAN_EXIT=$?
 
-      - name: "📊 Plan Summary"
+          # Exit codes: 0=no changes, 1=error, 2=changes present
+          PLAN_EXIT=${PLAN_EXIT:-0}
+          if [ "$PLAN_EXIT" -eq 1 ]; then
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            exit 1
+          elif [ "$PLAN_EXIT" -eq 2 ]; then
+            echo "status=changes" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=no-changes" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Parse resource counts from plan output
+          SUMMARY_LINE=$(grep -E "Plan:|No changes" /tmp/plan-output.txt | tail -1 || true)
+          echo "summary=$SUMMARY_LINE" >> "$GITHUB_OUTPUT"
+
+          ADD=$(echo "$SUMMARY_LINE" | grep -oP '\d+(?= to add)' || echo "0")
+          CHANGE=$(echo "$SUMMARY_LINE" | grep -oP '\d+(?= to change)' || echo "0")
+          DESTROY=$(echo "$SUMMARY_LINE" | grep -oP '\d+(?= to destroy)' || echo "0")
+          echo "add=$ADD" >> "$GITHUB_OUTPUT"
+          echo "change=$CHANGE" >> "$GITHUB_OUTPUT"
+          echo "destroy=$DESTROY" >> "$GITHUB_OUTPUT"
+
+      - name: "📤 Upload plan artifact"
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ inputs.working_directory }}/tfplan
+          retention-days: 1
+
+      - name: "📝 Plan Summary"
         if: always()
         working-directory: ${{ inputs.working_directory }}
         run: |
-          if [ -f tfplan ]; then
-            terraform show -no-color tfplan | tail -20
+          STATUS="${{ steps.plan.outputs.status }}"
+          ADD="${{ steps.plan.outputs.add }}"
+          CHANGE="${{ steps.plan.outputs.change }}"
+          DESTROY="${{ steps.plan.outputs.destroy }}"
+
+          if [ "$STATUS" = "no-changes" ]; then
+            PLAN_ICON="✅"
+            PLAN_HEADLINE="No changes — infrastructure is up to date"
+          elif [ "$STATUS" = "error" ]; then
+            PLAN_ICON="❌"
+            PLAN_HEADLINE="Plan failed"
+          else
+            PLAN_ICON="📋"
+            PLAN_HEADLINE="Changes detected"
           fi
 
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+          ## ${PLAN_ICON} Terraform Plan
+
+          **${PLAN_HEADLINE}**
+
+          | Action | Count |
+          |--------|-------|
+          | 🟢 Add | ${ADD} |
+          | 🟡 Change | ${CHANGE} |
+          | 🔴 Destroy | ${DESTROY} |
+          SUMMARY
+
+          # Resource-level change table
+          if [ -f /tmp/plan-output.txt ] && [ "$STATUS" = "changes" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "<details><summary>Resource changes</summary>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Action | Resource |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|----------|" >> "$GITHUB_STEP_SUMMARY"
+
+            grep -E '^\s+#\s+(.*)\s+(will be|must be)' /tmp/plan-output.txt | while IFS= read -r line; do
+              RESOURCE=$(echo "$line" | sed -E 's/^\s+#\s+//' | sed -E 's/\s+(will be|must be).*//')
+              if echo "$line" | grep -q "created"; then
+                echo "| 🟢 create | \`$RESOURCE\` |" >> "$GITHUB_STEP_SUMMARY"
+              elif echo "$line" | grep -q "updated"; then
+                echo "| 🟡 update | \`$RESOURCE\` |" >> "$GITHUB_STEP_SUMMARY"
+              elif echo "$line" | grep -q "destroyed"; then
+                echo "| 🔴 destroy | \`$RESOURCE\` |" >> "$GITHUB_STEP_SUMMARY"
+              elif echo "$line" | grep -q "replaced"; then
+                echo "| 🟠 replace | \`$RESOURCE\` |" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done
+
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "<details><summary>Full plan output</summary>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -80 /tmp/plan-output.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ── 4. Apply ───────────────────────────────────────────────────────────────
+  apply:
+    name: "Apply"
+    if: inputs.action == 'apply'
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
+      HAS_APP_ID: ${{ secrets.JETPACK_APP_ID }}
+    steps:
+      - name: "⚙️ Setup Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: "📥 Restore working directory"
+        uses: actions/download-artifact@v4
+        with:
+          name: tf-working-dir
+          path: ${{ inputs.working_directory }}
+
+      - name: "📥 Download plan"
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ inputs.working_directory }}
+
+      - name: "🔑 Generate token for private TF modules"
+        if: env.HAS_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        id: tf-modules-token
+        with:
+          app-id: ${{ secrets.JETPACK_APP_ID }}
+          private-key: ${{ secrets.JETPACK_APP_PRIVATE_KEY }}
+          owner: getjetpack
+          repositories: jetpack-tf-modules
+
+      - name: "🔑 Configure git for private TF modules"
+        if: steps.tf-modules-token.outputs.token != ''
+        run: git config --global url."https://x-access-token:${{ steps.tf-modules-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
       - name: "🚀 Terraform Apply"
-        if: ${{ inputs.action == 'apply' }}
+        id: apply
         working-directory: ${{ inputs.working_directory }}
-        run: terraform apply -auto-approve tfplan
+        run: |
+          terraform apply -auto-approve -no-color tfplan 2>&1 | tee /tmp/apply-output.txt
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: "📝 Apply Summary"
+        if: always()
+        run: |
+          if [ "${{ steps.apply.outcome }}" = "success" ]; then
+            APPLY_ICON="🚀"
+            APPLY_STATUS="Apply succeeded"
+          else
+            APPLY_ICON="❌"
+            APPLY_STATUS="Apply failed"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+          ## ${APPLY_ICON} Terraform Apply
+
+          **${APPLY_STATUS}**
+
+          | Setting | Value |
+          |---------|-------|
+          | **Directory** | \`${{ inputs.working_directory }}\` |
+          | **Environment** | \`${{ inputs.environment || 'default' }}\` |
+          | **Region** | \`${{ inputs.aws_region }}\` |
+          SUMMARY
+
+          if [ -f /tmp/apply-output.txt ]; then
+            # Extract "Apply complete! Resources: X added, Y changed, Z destroyed."
+            RESULT_LINE=$(grep -E "Apply complete!" /tmp/apply-output.txt || true)
+            if [ -n "$RESULT_LINE" ]; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "> $RESULT_LINE" >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            # Show outputs if present
+            OUTPUTS=$(sed -n '/^Outputs:/,$ p' /tmp/apply-output.txt || true)
+            if [ -n "$OUTPUTS" ]; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "<details><summary>Outputs</summary>" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              echo "$OUTPUTS" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
