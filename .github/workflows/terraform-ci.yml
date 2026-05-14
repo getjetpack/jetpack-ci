@@ -65,6 +65,28 @@ jobs:
       - name: "📥 Checkout"
         uses: actions/checkout@v4
 
+      - name: "🪣 Ensure S3 state bucket exists"
+        run: |
+          if ! aws s3api head-bucket --bucket "${{ inputs.backend_bucket }}" 2>/dev/null; then
+            echo "Creating S3 bucket: ${{ inputs.backend_bucket }}"
+            aws s3api create-bucket \
+              --bucket "${{ inputs.backend_bucket }}" \
+              --region "${{ inputs.backend_region }}" \
+              $(if [ "${{ inputs.backend_region }}" != "us-east-1" ]; then echo "--create-bucket-configuration LocationConstraint=${{ inputs.backend_region }}"; fi)
+            aws s3api put-bucket-versioning \
+              --bucket "${{ inputs.backend_bucket }}" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption \
+              --bucket "${{ inputs.backend_bucket }}" \
+              --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+            aws s3api put-public-access-block \
+              --bucket "${{ inputs.backend_bucket }}" \
+              --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+            echo "✅ Bucket created with versioning, encryption, and public access blocked"
+          else
+            echo "✅ Bucket already exists"
+          fi
+
       - name: "🔑 Generate token for private TF modules"
         if: env.HAS_APP_ID != ''
         uses: actions/create-github-app-token@v1
