@@ -282,6 +282,7 @@ jobs:
         id: plan
         working-directory: ${{ inputs.working_directory }}
         run: |
+          set -o pipefail
           PLAN_ARGS=""
           if [ -n "${{ inputs.var_file }}" ]; then
             PLAN_ARGS="-var-file=${{ inputs.var_file }}"
@@ -435,8 +436,8 @@ jobs:
         id: apply
         working-directory: ${{ inputs.working_directory }}
         run: |
+          set -o pipefail
           terraform apply -auto-approve -no-color tfplan 2>&1 | tee /tmp/apply-output.txt
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
       - name: "📝 Apply Summary"
         if: always()
