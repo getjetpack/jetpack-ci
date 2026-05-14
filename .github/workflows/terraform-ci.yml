@@ -40,6 +40,11 @@ on:
         description: "GitHub environment for approvals"
         required: false
         type: string
+      post_init_script:
+        description: "Shell commands to run after terraform init (e.g. auto-import existing resources)"
+        required: false
+        type: string
+        default: ""
     secrets:
       AWS_ACCESS_KEY_ID:
         required: true
@@ -117,6 +122,11 @@ jobs:
             -backend-config="bucket=${{ inputs.backend_bucket }}" \
             -backend-config="key=${{ inputs.backend_key }}" \
             -backend-config="region=${{ inputs.backend_region }}"
+
+      - name: "🔄 Post-init script"
+        if: inputs.post_init_script != ''
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.post_init_script }}
 
       - name: "📤 Cache initialized working directory"
         uses: actions/upload-artifact@v4
