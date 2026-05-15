@@ -293,23 +293,15 @@ jobs:
           terraform apply -auto-approve -no-color tfplan 2>&1 | tee /tmp/apply-output.txt
 
       - name: "Capture terraform outputs"
-        if: steps.apply.outcome == 'success' && inputs.action == 'apply' && inputs.callback_url != ''
+        if: steps.apply.outcome == 'success' && inputs.action == 'apply'
         id: outputs
         working-directory: ${{ inputs.working_directory }}
-        run: |
-          terraform output -json > /tmp/tf-outputs.json
-          cat /tmp/tf-outputs.json
+        run: terraform output -json > /tmp/tf-outputs.json
 
-      - name: "Send outputs to Jetpack API"
-        if: steps.outputs.outcome == 'success' && inputs.callback_url != ''
-        run: |
-          # Get GitHub OIDC token for Jetpack API authentication
-          OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=jetpack" | jq -r '.value')
-
-          curl -sf -X POST "${{ inputs.callback_url }}" \
-            -H "Authorization: Bearer ${OIDC_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d @/tmp/tf-outputs.json \
-            && echo "Outputs sent to Jetpack API" \
-            || echo "::warning::Failed to send outputs to Jetpack API"
+      - name: "Upload terraform outputs"
+        if: steps.outputs.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-outputs
+          path: /tmp/tf-outputs.json
+          retention-days: 90
