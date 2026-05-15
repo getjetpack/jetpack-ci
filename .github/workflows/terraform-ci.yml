@@ -13,7 +13,7 @@ on:
         type: string
         default: "latest"
       action:
-        description: "Terraform action: plan or apply"
+        description: "Terraform action: plan, apply, or destroy"
         required: true
         type: string
       backend_bucket:
@@ -297,6 +297,9 @@ jobs:
           if [ -n "${{ inputs.var_file }}" ]; then
             PLAN_ARGS="-var-file=${{ inputs.var_file }}"
           fi
+          if [ "${{ inputs.action }}" = "destroy" ]; then
+            PLAN_ARGS="$PLAN_ARGS -destroy"
+          fi
           terraform plan $PLAN_ARGS -out=tfplan -detailed-exitcode -no-color 2>&1 | tee /tmp/plan-output.txt || PLAN_EXIT=$?
 
           # Exit codes: 0=no changes, 1=error, 2=changes present
@@ -397,7 +400,7 @@ jobs:
   # ── 4. Apply ───────────────────────────────────────────────────────────────
   apply:
     name: "Apply"
-    if: inputs.action == 'apply'
+    if: inputs.action == 'apply' || inputs.action == 'destroy'
     needs: plan
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
@@ -442,26 +445,27 @@ jobs:
         if: steps.tf-modules-token.outputs.token != ''
         run: git config --global url."https://x-access-token:${{ steps.tf-modules-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
 
-      - name: "🚀 Terraform Apply"
+      - name: "🚀 Terraform ${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }}"
         id: apply
         working-directory: ${{ inputs.working_directory }}
         run: |
           set -o pipefail
           terraform apply -auto-approve -no-color tfplan 2>&1 | tee /tmp/apply-output.txt
 
-      - name: "📝 Apply Summary"
+      - name: "📝 ${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }} Summary"
         if: always()
         run: |
+          ACTION_LABEL="${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }}"
           if [ "${{ steps.apply.outcome }}" = "success" ]; then
-            APPLY_ICON="🚀"
-            APPLY_STATUS="Apply succeeded"
+            APPLY_ICON="${{ inputs.action == 'destroy' && '💥' || '🚀' }}"
+            APPLY_STATUS="${ACTION_LABEL} succeeded"
           else
             APPLY_ICON="❌"
-            APPLY_STATUS="Apply failed"
+            APPLY_STATUS="${ACTION_LABEL} failed"
           fi
 
           cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
-          ## ${APPLY_ICON} Terraform Apply
+          ## ${APPLY_ICON} Terraform ${ACTION_LABEL}
 
           **${APPLY_STATUS}**
 
