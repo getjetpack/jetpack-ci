@@ -40,6 +40,16 @@ on:
         description: "GitHub environment for approvals"
         required: false
         type: string
+      use_oidc:
+        description: "Use GitHub OIDC to assume an AWS role (no static keys needed)"
+        required: false
+        type: boolean
+        default: false
+      aws_role_arn:
+        description: "AWS IAM role ARN to assume via OIDC"
+        required: false
+        type: string
+        default: ""
       post_init_script:
         description: "Shell commands to run after terraform init (e.g. auto-import existing resources)"
         required: false
@@ -47,9 +57,9 @@ on:
         default: ""
     secrets:
       AWS_ACCESS_KEY_ID:
-        required: true
+        required: false
       AWS_SECRET_ACCESS_KEY:
-        required: true
+        required: false
       JETPACK_APP_ID:
         required: false
       JETPACK_APP_PRIVATE_KEY:
@@ -64,14 +74,30 @@ jobs:
   init:
     name: "Init"
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
       HAS_APP_ID: ${{ secrets.JETPACK_APP_ID }}
     steps:
       - name: "📥 Checkout"
         uses: actions/checkout@v4
+
+      - name: "🔐 Configure AWS (OIDC)"
+        if: inputs.use_oidc
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: "🔐 Configure AWS (static keys)"
+        if: "!inputs.use_oidc"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
 
       - name: "🪣 Ensure S3 state bucket exists"
         run: |
@@ -139,15 +165,17 @@ jobs:
       - name: "📝 Init Summary"
         if: always()
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" << 'SUMMARY'
+          AUTH_MODE="${{ inputs.use_oidc && 'OIDC' || 'Static keys' }}"
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
           ## 📦 Terraform Init
 
           | Setting | Value |
           |---------|-------|
-          | **Directory** | `${{ inputs.working_directory }}` |
-          | **Backend** | `s3://${{ inputs.backend_bucket }}/${{ inputs.backend_key }}` |
-          | **Region** | `${{ inputs.aws_region }}` |
-          | **Terraform** | `${{ inputs.terraform_version }}` |
+          | **Directory** | \`${{ inputs.working_directory }}\` |
+          | **Backend** | \`s3://${{ inputs.backend_bucket }}/${{ inputs.backend_key }}\` |
+          | **Region** | \`${{ inputs.aws_region }}\` |
+          | **Auth** | ${AUTH_MODE} |
+          | **Terraform** | \`${{ inputs.terraform_version }}\` |
           SUMMARY
 
           if [ "$BUCKET_STATUS" = "created" ]; then
@@ -253,9 +281,10 @@ jobs:
     name: "Plan"
     needs: [validate, scan]
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
       HAS_APP_ID: ${{ secrets.JETPACK_APP_ID }}
     steps:
@@ -273,6 +302,21 @@ jobs:
 
       - name: "🔧 Restore provider permissions"
         run: find ${{ inputs.working_directory }}/.terraform -name 'terraform-provider-*' -exec chmod +x {} +
+
+      - name: "🔐 Configure AWS (OIDC)"
+        if: inputs.use_oidc
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: "🔐 Configure AWS (static keys)"
+        if: "!inputs.use_oidc"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
 
       - name: "🔑 Generate token for private TF modules"
         if: env.HAS_APP_ID != ''
@@ -399,14 +443,15 @@ jobs:
 
   # ── 4. Apply ───────────────────────────────────────────────────────────────
   apply:
-    name: "Apply"
+    name: "${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }}"
     if: inputs.action == 'apply' || inputs.action == 'destroy'
     needs: plan
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     environment: ${{ inputs.environment }}
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
       HAS_APP_ID: ${{ secrets.JETPACK_APP_ID }}
     steps:
@@ -430,6 +475,21 @@ jobs:
 
       - name: "🔧 Restore provider permissions"
         run: find ${{ inputs.working_directory }}/.terraform -name 'terraform-provider-*' -exec chmod +x {} +
+
+      - name: "🔐 Configure AWS (OIDC)"
+        if: inputs.use_oidc
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: "🔐 Configure AWS (static keys)"
+        if: "!inputs.use_oidc"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
 
       - name: "🔑 Generate token for private TF modules"
         if: env.HAS_APP_ID != ''
@@ -478,7 +538,7 @@ jobs:
 
           if [ -f /tmp/apply-output.txt ]; then
             # Extract "Apply complete! Resources: X added, Y changed, Z destroyed."
-            RESULT_LINE=$(grep -E "Apply complete!" /tmp/apply-output.txt || true)
+            RESULT_LINE=$(grep -E "Apply complete!|Destroy complete!" /tmp/apply-output.txt || true)
             if [ -n "$RESULT_LINE" ]; then
               echo "" >> "$GITHUB_STEP_SUMMARY"
               echo "> $RESULT_LINE" >> "$GITHUB_STEP_SUMMARY"
