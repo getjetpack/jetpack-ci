@@ -273,7 +273,21 @@ jobs:
         run: git config --global url."https://x-access-token:${{ steps.tf-modules-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
 
       - name: "Terraform ${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }}"
+        id: apply
         working-directory: ${{ inputs.working_directory }}
         run: |
           set -o pipefail
           terraform apply -auto-approve -no-color tfplan
+
+      - name: "Capture terraform outputs"
+        if: steps.apply.outcome == 'success' && inputs.action == 'apply'
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform output -json > /tmp/tf-outputs.json
+
+      - name: "Upload terraform outputs"
+        if: steps.apply.outcome == 'success' && inputs.action == 'apply'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-outputs
+          path: /tmp/tf-outputs.json
+          retention-days: 90
