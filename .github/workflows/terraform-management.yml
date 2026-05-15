@@ -1,7 +1,8 @@
-name: "Terraform CI (Reusable)"
+name: "Terraform Management (Reusable)"
 
-# OIDC-only workflow for bootstrap and per-environment infrastructure.
-# Assumes an IAM role in the target account via GitHub OIDC — no static keys.
+# For foundation & identity layers that run in the management account
+# with static AWS credentials. After apply, sends terraform outputs
+# to Jetpack API using GitHub OIDC for authentication.
 
 on:
   workflow_call:
@@ -39,39 +40,47 @@ on:
         description: "AWS region for provider"
         required: true
         type: string
-      aws_role_arn:
-        description: "AWS IAM role ARN to assume via OIDC"
-        required: true
-        type: string
       environment:
         description: "GitHub environment for approvals"
         required: false
         type: string
+      callback_url:
+        description: "Jetpack API URL to POST terraform outputs after apply"
+        required: false
+        type: string
+        default: ""
+      post_init_script:
+        description: "Shell commands to run after terraform init"
+        required: false
+        type: string
+        default: ""
     secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
       JETPACK_APP_ID:
         required: false
       JETPACK_APP_PRIVATE_KEY:
         required: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Jobs: Init → Validate + Scan (parallel) → Plan → Apply → Callback
+# ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
   # ── 1. Init ────────────────────────────────────────────────────────────────
   init:
     name: "Init"
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
     env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
       HAS_APP_ID: ${{ secrets.JETPACK_APP_ID }}
     steps:
       - name: "Checkout"
         uses: actions/checkout@v4
-
-      - name: "Configure AWS (OIDC)"
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ inputs.aws_role_arn }}
-          aws-region: ${{ inputs.aws_region }}
 
       - name: "Ensure S3 state bucket exists"
         run: |
@@ -119,6 +128,11 @@ jobs:
             -backend-config="key=${{ inputs.backend_key }}" \
             -backend-config="region=${{ inputs.backend_region }}"
 
+      - name: "Post-init script"
+        if: inputs.post_init_script != ''
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.post_init_script }}
+
       - name: "Cache initialized working directory"
         uses: actions/upload-artifact@v4
         with:
@@ -152,15 +166,22 @@ jobs:
         working-directory: ${{ inputs.working_directory }}
         run: terraform validate -no-color
 
+      - name: "Terraform Format Check"
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          if ! terraform fmt -check -recursive -diff 2>&1; then
+            echo "::warning::Terraform formatting drift detected"
+          fi
+
   # ── 3. Plan ──────────────────────────────────────────────────────────────
   plan:
     name: "Plan"
     needs: validate
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
     env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
       HAS_APP_ID: ${{ secrets.JETPACK_APP_ID }}
     steps:
       - name: "Setup Terraform"
@@ -178,12 +199,6 @@ jobs:
       - name: "Restore provider permissions"
         run: find ${{ inputs.working_directory }}/.terraform -name 'terraform-provider-*' -exec chmod +x {} +
 
-      - name: "Configure AWS (OIDC)"
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ inputs.aws_role_arn }}
-          aws-region: ${{ inputs.aws_region }}
-
       - name: "Generate token for private TF modules"
         if: env.HAS_APP_ID != ''
         uses: actions/create-github-app-token@v1
@@ -199,6 +214,7 @@ jobs:
         run: git config --global url."https://x-access-token:${{ steps.tf-modules-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
 
       - name: "Terraform Plan"
+        id: plan
         working-directory: ${{ inputs.working_directory }}
         run: |
           set -o pipefail
@@ -209,7 +225,7 @@ jobs:
           if [ "${{ inputs.action }}" = "destroy" ]; then
             PLAN_ARGS="$PLAN_ARGS -destroy"
           fi
-          terraform plan $PLAN_ARGS -out=tfplan -no-color
+          terraform plan $PLAN_ARGS -out=tfplan -no-color 2>&1 | tee /tmp/plan-output.txt
 
       - name: "Upload plan artifact"
         uses: actions/upload-artifact@v4
@@ -229,6 +245,9 @@ jobs:
       contents: read
     environment: ${{ inputs.environment }}
     env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
       HAS_APP_ID: ${{ secrets.JETPACK_APP_ID }}
     steps:
       - name: "Setup Terraform"
@@ -252,12 +271,6 @@ jobs:
       - name: "Restore provider permissions"
         run: find ${{ inputs.working_directory }}/.terraform -name 'terraform-provider-*' -exec chmod +x {} +
 
-      - name: "Configure AWS (OIDC)"
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ inputs.aws_role_arn }}
-          aws-region: ${{ inputs.aws_region }}
-
       - name: "Generate token for private TF modules"
         if: env.HAS_APP_ID != ''
         uses: actions/create-github-app-token@v1
@@ -273,7 +286,30 @@ jobs:
         run: git config --global url."https://x-access-token:${{ steps.tf-modules-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
 
       - name: "Terraform ${{ inputs.action == 'destroy' && 'Destroy' || 'Apply' }}"
+        id: apply
         working-directory: ${{ inputs.working_directory }}
         run: |
           set -o pipefail
-          terraform apply -auto-approve -no-color tfplan
+          terraform apply -auto-approve -no-color tfplan 2>&1 | tee /tmp/apply-output.txt
+
+      - name: "Capture terraform outputs"
+        if: steps.apply.outcome == 'success' && inputs.action == 'apply' && inputs.callback_url != ''
+        id: outputs
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          terraform output -json > /tmp/tf-outputs.json
+          cat /tmp/tf-outputs.json
+
+      - name: "Send outputs to Jetpack API"
+        if: steps.outputs.outcome == 'success' && inputs.callback_url != ''
+        run: |
+          # Get GitHub OIDC token for Jetpack API authentication
+          OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=jetpack" | jq -r '.value')
+
+          curl -sf -X POST "${{ inputs.callback_url }}" \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/tf-outputs.json \
+            && echo "Outputs sent to Jetpack API" \
+            || echo "::warning::Failed to send outputs to Jetpack API"
