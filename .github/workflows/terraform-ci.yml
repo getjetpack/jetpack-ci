@@ -282,7 +282,27 @@ jobs:
       - name: "Capture terraform outputs"
         if: steps.apply.outcome == 'success' && inputs.action == 'apply'
         working-directory: ${{ inputs.working_directory }}
-        run: terraform output -json > /tmp/tf-outputs.json
+        run: |
+          terraform output -json > /tmp/tf-outputs.json
+
+          # If VPN profile exists in S3, download and embed in outputs
+          VPN_BUCKET=$(terraform output -raw vpn_profile_s3_bucket 2>/dev/null || echo "")
+          VPN_KEY=$(terraform output -raw vpn_profile_s3_key 2>/dev/null || echo "")
+          if [ -n "$VPN_BUCKET" ] && [ -n "$VPN_KEY" ]; then
+            echo "Downloading VPN profile from s3://$VPN_BUCKET/$VPN_KEY"
+            for i in 1 2 3 4 5; do
+              if aws s3 cp "s3://$VPN_BUCKET/$VPN_KEY" /tmp/vpn-profile.ovpn 2>/dev/null; then
+                OVPN_CONTENT=$(cat /tmp/vpn-profile.ovpn | jq -Rs .)
+                # Inject into outputs JSON
+                jq --arg content "$OVPN_CONTENT" '. + {"vpn_profile_ovpn": {"value": ($content | fromjson), "type": "string", "sensitive": false}}' /tmp/tf-outputs.json > /tmp/tf-outputs-tmp.json
+                mv /tmp/tf-outputs-tmp.json /tmp/tf-outputs.json
+                echo "VPN profile embedded in outputs"
+                break
+              fi
+              echo "VPN profile not ready yet (attempt $i/5), waiting 30s..."
+              sleep 30
+            done
+          fi
 
       - name: "Upload terraform outputs"
         if: steps.apply.outcome == 'success' && inputs.action == 'apply'
