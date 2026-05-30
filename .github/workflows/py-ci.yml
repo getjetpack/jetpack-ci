@@ -1,0 +1,294 @@
+name: "🐍 Python Service CI/CD (Reusable)"
+
+# Cloud-agnostic build → test → push image → run service TF → helm deploy.
+# The same workflow handles AWS, GCP, and Azure — the cloud comes in as an
+# input and gates the auth + registry-login + kubeconfig steps via case
+# switches. Terraform/kubectl/helm CLIs are identical across clouds.
+#
+# Used by service repos like:
+#
+#   jobs:
+#     deploy:
+#       uses: getjetpack/jetpack-ci/.github/workflows/py-ci.yml@main
+#       with:
+#         cloud: gcp
+#         env: dev
+#         service_name: user-service
+#         region: us-west2
+#         image_repo: us-west2-docker.pkg.dev/proj/user-service/user-service
+#         cluster_name: gcp-dev
+#         cluster_location: us-west2-a
+#         gcp_workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+#         gcp_service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+on:
+  workflow_call:
+    inputs:
+      # ── Core (always required) ─────────────────────────────────────────
+      cloud:
+        description: "aws | gcp | azure"
+        required: true
+        type: string
+      service_name:
+        required: true
+        type: string
+      env:
+        description: "Target environment (dev | staging | prod)"
+        required: true
+        type: string
+      region:
+        required: true
+        type: string
+      image_repo:
+        description: "Fully-qualified container image repo (ECR/AR/ACR)"
+        required: true
+        type: string
+      cluster_name:
+        required: true
+        type: string
+      cluster_location:
+        description: "Cluster region (regional) or zone (zonal). For AKS, the resource group."
+        required: true
+        type: string
+
+      # ── Optional knobs ──────────────────────────────────────────────────
+      python_version:
+        default: "3.12"
+        type: string
+      chart_path:
+        default: "./helm"
+        type: string
+      tf_dir:
+        default: "./infra"
+        type: string
+      run_tests:
+        default: true
+        type: boolean
+      namespace:
+        description: "K8s namespace. Defaults to the env name."
+        default: ""
+        type: string
+      helm_timeout:
+        default: "5m"
+        type: string
+
+      # ── AWS-specific (used when cloud=aws) ─────────────────────────────
+      aws_role_arn:
+        description: "IAM role ARN to assume via OIDC"
+        default: ""
+        type: string
+
+      # ── GCP-specific (used when cloud=gcp) ─────────────────────────────
+      gcp_workload_identity_provider:
+        description: "WIF provider resource name from foundation outputs"
+        default: ""
+        type: string
+      gcp_service_account:
+        description: "Deploy service account email from foundation outputs"
+        default: ""
+        type: string
+
+      # ── Azure-specific (used when cloud=azure) ─────────────────────────
+      azure_client_id:
+        default: ""
+        type: string
+      azure_tenant_id:
+        default: ""
+        type: string
+      azure_subscription_id:
+        default: ""
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  pipeline:
+    name: "${{ inputs.service_name }} → ${{ inputs.env }} (${{ inputs.cloud }})"
+    runs-on: ubuntu-latest
+    env:
+      NS: ${{ inputs.namespace != '' && inputs.namespace || inputs.env }}
+    steps:
+      # ── 1. Checkout + language setup ────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f pyproject.toml ]; then pip install -e . || true; fi
+
+      # ── 2. Test ──────────────────────────────────────────────────────────
+      - name: Run tests
+        if: inputs.run_tests
+        run: |
+          if [ -f pytest.ini ] || [ -f pyproject.toml ] || [ -d tests ]; then
+            pytest -v
+          else
+            echo "::warning::No tests configured — skipping"
+          fi
+
+      # ── 3. Cloud auth (one of AWS / GCP / Azure) ────────────────────────
+      - name: Authenticate to AWS (OIDC)
+        if: inputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+          service_account: ${{ inputs.gcp_service_account }}
+
+      - name: Setup gcloud
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Authenticate to Azure (OIDC)
+        if: inputs.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ inputs.azure_client_id }}
+          tenant-id: ${{ inputs.azure_tenant_id }}
+          subscription-id: ${{ inputs.azure_subscription_id }}
+
+      # ── 4. Build + push container image ─────────────────────────────────
+      - name: Resolve image tag
+        id: tag
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          STAMP=$(date -u +%Y%m%d-%H%M)
+          echo "tag=${SHORT_SHA}-${STAMP}" >> "$GITHUB_OUTPUT"
+          echo "full=${{ inputs.image_repo }}:${SHORT_SHA}-${STAMP}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Registry login (cloud-aware)
+        env:
+          IMAGE_REPO: ${{ inputs.image_repo }}
+        run: |
+          case "${{ inputs.cloud }}" in
+            aws)
+              REGISTRY="${IMAGE_REPO%%/*}"
+              aws ecr get-login-password --region "${{ inputs.region }}" \
+                | docker login --username AWS --password-stdin "$REGISTRY"
+              ;;
+            gcp)
+              REGISTRY="${IMAGE_REPO%%/*}"
+              gcloud auth configure-docker "$REGISTRY" --quiet
+              ;;
+            azure)
+              REGISTRY="${IMAGE_REPO%%/*}"
+              az acr login --name "${REGISTRY%%.*}"
+              ;;
+            *)
+              echo "::error::Unknown cloud '${{ inputs.cloud }}'"
+              exit 1
+              ;;
+          esac
+
+      - name: Build + push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tag.outputs.full }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── 5. Service Terraform (per-service infra — DB, secrets, …) ──────
+      - name: Setup Terraform
+        if: hashFiles(format('{0}/*.tf', inputs.tf_dir)) != ''
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform apply (service infra)
+        if: hashFiles(format('{0}/*.tf', inputs.tf_dir)) != ''
+        working-directory: ${{ inputs.tf_dir }}
+        env:
+          TF_VAR_service_name: ${{ inputs.service_name }}
+          TF_VAR_env: ${{ inputs.env }}
+          TF_VAR_region: ${{ inputs.region }}
+          TF_VAR_image_tag: ${{ steps.tag.outputs.tag }}
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      # ── 6. Update kubeconfig (cloud-aware CLI) ──────────────────────────
+      - name: Update kubeconfig
+        run: |
+          case "${{ inputs.cloud }}" in
+            aws)
+              aws eks update-kubeconfig \
+                --name "${{ inputs.cluster_name }}" \
+                --region "${{ inputs.region }}"
+              ;;
+            gcp)
+              # cluster_location is a zone (zonal) or region (regional)
+              gcloud container clusters get-credentials \
+                "${{ inputs.cluster_name }}" \
+                --location "${{ inputs.cluster_location }}"
+              ;;
+            azure)
+              # cluster_location holds the resource group on Azure
+              az aks get-credentials \
+                --name "${{ inputs.cluster_name }}" \
+                --resource-group "${{ inputs.cluster_location }}" \
+                --overwrite-existing
+              ;;
+          esac
+          kubectl config current-context
+          kubectl get nodes -o wide
+
+      # ── 7. Helm deploy (cloud-agnostic) ─────────────────────────────────
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.14.0"
+
+      - name: Helm upgrade --install
+        run: |
+          helm upgrade --install "${{ inputs.service_name }}" "${{ inputs.chart_path }}" \
+            --namespace "$NS" \
+            --create-namespace \
+            --set image.repository="${{ inputs.image_repo }}" \
+            --set image.tag="${{ steps.tag.outputs.tag }}" \
+            --set environment="${{ inputs.env }}" \
+            --set service.name="${{ inputs.service_name }}" \
+            --wait \
+            --atomic \
+            --timeout "${{ inputs.helm_timeout }}"
+
+      - name: Verify rollout
+        run: |
+          kubectl -n "$NS" rollout status "deploy/${{ inputs.service_name }}" --timeout="${{ inputs.helm_timeout }}"
+          kubectl -n "$NS" get pods -l "app.kubernetes.io/name=${{ inputs.service_name }}"
+
+      # ── 8. Summary ──────────────────────────────────────────────────────
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## ${{ inputs.service_name }} → ${{ inputs.env }} on ${{ inputs.cloud }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Cloud | \`${{ inputs.cloud }}\` |"
+            echo "| Cluster | \`${{ inputs.cluster_name }}\` @ \`${{ inputs.cluster_location }}\` |"
+            echo "| Image | \`${{ steps.tag.outputs.full }}\` |"
+            echo "| Namespace | \`$NS\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
