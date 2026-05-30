@@ -9,6 +9,19 @@ name: "🐍 Python Service CI/CD (Reusable)"
 # auth/registry/kubeconfig are gated by `case` switches. Each job exposes
 # outputs so downstream jobs can pick them up via `needs.<job>.outputs.X`.
 #
+# Image path convention (constructed inside this workflow):
+#
+#   image_repo = {image_registry}/{organization}/{project_name}/{domain}/{service_name}
+#   image_full = {image_repo}:{tag}
+#
+# That layout works for all clouds:
+#   AWS  ECR:  123456789.dkr.ecr.us-west-2.amazonaws.com/testa/gcp/users/user-service
+#   GCP  AR :  us-west2-docker.pkg.dev/testa/gcp/users/user-service
+#   Azure ACR: acrname.azurecr.io/testa/gcp/users/user-service
+#
+# Pass `image_repo_override` (a fully-qualified repo URL, no tag) to bypass
+# the convention entirely — useful for legacy registries or shared images.
+#
 # Caller example:
 #
 #   jobs:
@@ -16,10 +29,13 @@ name: "🐍 Python Service CI/CD (Reusable)"
 #       uses: getjetpack/jetpack-ci/.github/workflows/py-ci.yml@main
 #       with:
 #         cloud: gcp
+#         organization: testa
+#         project_name: gcp
+#         domain: users           # service domain — comes from service config
+#         service_name: user-service
 #         env: dev
 #         region: us-west2
-#         service_name: user-service
-#         image_repo: us-west2-docker.pkg.dev/proj/user-service/user-service
+#         image_registry: us-west2-docker.pkg.dev
 #         cluster_name: gcp-dev
 #         cluster_location: us-west2-a
 #         gcp_workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
@@ -28,30 +44,40 @@ name: "🐍 Python Service CI/CD (Reusable)"
 on:
   workflow_call:
     inputs:
-      cloud:                          { description: "aws | gcp | azure",                         required: true, type: string }
-      service_name:                   { required: true, type: string }
-      env:                            { description: "dev | staging | prod",                     required: true, type: string }
-      region:                         { required: true, type: string }
-      image_repo:                     { description: "Fully-qualified image repo (ECR/AR/ACR)",  required: true, type: string }
-      cluster_name:                   { required: true, type: string }
-      cluster_location:               { description: "Region/zone (k8s) or resource-group (AKS)", required: true, type: string }
+      # ── 🏷️ identity ──────────────────────────────────────────────────────
+      organization:                   { description: "Jetpack org slug — first path segment of the image repo (e.g. testa)", required: true, type: string }
+      project_name:                   { description: "Jetpack project slug (e.g. gcp)",                                    required: true, type: string }
+      domain:                         { description: "Service domain — groups related services (e.g. users, orders)",     required: true, type: string }
+      service_name:                   { description: "Service slug — last path segment of the image repo (e.g. user-svc)", required: true, type: string }
+      env:                            { description: "dev | staging | prod",                                              required: true, type: string }
+      region:                         { description: "Cloud region for both image registry and runtime",                  required: true, type: string }
 
-      python_version:                 { default: "3.12", type: string }
-      chart_path:                     { default: "./helm", type: string }
-      tf_dir:                         { default: "./infra", type: string }
-      run_tests:                      { default: true, type: boolean }
-      namespace:                      { default: "", type: string }
-      helm_timeout:                   { default: "5m", type: string }
+      # ── ☁️ cloud ─────────────────────────────────────────────────────────
+      cloud:                          { description: "aws | gcp | azure",                                                 required: true, type: string }
+      aws_role_arn:                   { description: "AWS only — IAM role ARN assumed via OIDC",                          default: "", type: string }
+      gcp_workload_identity_provider: { description: "GCP only — Workload Identity provider resource name",               default: "", type: string }
+      gcp_service_account:            { description: "GCP only — deploy service account email",                           default: "", type: string }
+      azure_client_id:                { description: "Azure only — federated client ID",                                  default: "", type: string }
+      azure_tenant_id:                { description: "Azure only — tenant ID",                                            default: "", type: string }
+      azure_subscription_id:          { description: "Azure only — subscription ID",                                      default: "", type: string }
 
-      # AWS
-      aws_role_arn:                   { default: "", type: string }
-      # GCP
-      gcp_workload_identity_provider: { default: "", type: string }
-      gcp_service_account:            { default: "", type: string }
-      # Azure
-      azure_client_id:                { default: "", type: string }
-      azure_tenant_id:                { default: "", type: string }
-      azure_subscription_id:          { default: "", type: string }
+      # ── 🐳 container ─────────────────────────────────────────────────────
+      image_registry:                 { description: "Registry host (e.g. us-west2-docker.pkg.dev, 123.dkr.ecr.us-west-2.amazonaws.com, acr.azurecr.io)", required: true, type: string }
+      image_repo_override:            { description: "Override the {registry}/{org}/{project}/{domain}/{service} convention with a fully-qualified repo URL (no tag).", default: "", type: string }
+
+      # ── ⚓ cluster ──────────────────────────────────────────────────────
+      cluster_name:                   { description: "Target Kubernetes cluster name",                                    required: true, type: string }
+      cluster_location:               { description: "Region/zone for k8s (EKS/GKE) or resource group (AKS)",             required: true, type: string }
+      chart_path:                     { description: "Helm chart directory inside the repo",                              default: "./helm", type: string }
+      namespace:                      { description: "K8s namespace — defaults to `domain` so all services in the same domain share a namespace", default: "", type: string }
+      helm_timeout:                   { description: "Helm rollout timeout (e.g. 5m, 10m)",                               default: "5m", type: string }
+
+      # ── 🐍 python ────────────────────────────────────────────────────────
+      python_version:                 { description: "Python version for setup-python",                                   default: "3.12", type: string }
+      run_tests:                      { description: "Run pytest in the test job",                                        default: true,   type: boolean }
+
+      # ── 🏗️ terraform (service infra) ────────────────────────────────────
+      tf_dir:                         { description: "Per-service Terraform directory — apply only runs if files here changed", default: "./infra", type: string }
 
 permissions:
   id-token: write
@@ -63,6 +89,7 @@ jobs:
     name: "🎬 Init"
     runs-on: ubuntu-latest
     outputs:
+      image_repo:       ${{ steps.repo.outputs.repo }}
       image_tag:        ${{ steps.tag.outputs.tag }}
       image_full:       ${{ steps.tag.outputs.full }}
       namespace:        ${{ steps.ctx.outputs.namespace }}
@@ -75,24 +102,42 @@ jobs:
         with:
           fetch-depth: 2  # need previous commit for diff
 
+      - name: "🧩 Compose image_repo"
+        id: repo
+        run: |
+          # Convention: {registry}/{org}/{project}/{domain}/{service}
+          # The override input wins when provided (legacy registries, shared repos).
+          if [ -n "${{ inputs.image_repo_override }}" ]; then
+            REPO="${{ inputs.image_repo_override }}"
+            echo "::notice title=🧩 Repo override::using ${REPO}"
+          else
+            REPO="${{ inputs.image_registry }}/${{ inputs.organization }}/${{ inputs.project_name }}/${{ inputs.domain }}/${{ inputs.service_name }}"
+            echo "::notice title=🧩 Image repo composed::${REPO}"
+          fi
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+
       - name: "🏷️ Resolve image tag"
         id: tag
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           STAMP=$(date -u +%Y%m%d-%H%M)
           TAG="${SHORT_SHA}-${STAMP}"
+          REPO="${{ steps.repo.outputs.repo }}"
           {
             echo "tag=${TAG}"
             echo "sha_short=${SHORT_SHA}"
-            echo "full=${{ inputs.image_repo }}:${TAG}"
+            echo "full=${REPO}:${TAG}"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice title=🏷️ Image tag::${{ inputs.image_repo }}:${TAG}"
+          echo "::notice title=🏷️ Image tag::${REPO}:${TAG}"
 
       - name: "📦 Context"
         id: ctx
         run: |
+          # Namespace defaults to the service `domain` — services in the same
+          # domain (e.g. users → user-svc + auth-svc + profile-svc) end up in
+          # one namespace and can talk via short service names.
           NS="${{ inputs.namespace }}"
-          if [ -z "$NS" ]; then NS="${{ inputs.env }}"; fi
+          if [ -z "$NS" ]; then NS="${{ inputs.domain }}"; fi
           echo "namespace=$NS" >> "$GITHUB_OUTPUT"
           echo "::notice title=📦 Namespace::$NS"
 
@@ -342,7 +387,7 @@ jobs:
 
       - name: "🔑 Registry login (cloud-aware)"
         env:
-          IMAGE_REPO: ${{ inputs.image_repo }}
+          IMAGE_REPO: ${{ needs.init.outputs.image_repo }}
         run: |
           case "${{ inputs.cloud }}" in
             aws)
@@ -468,7 +513,7 @@ jobs:
           helm upgrade --install "${{ inputs.service_name }}" "${{ inputs.chart_path }}" \
             --namespace "$NS" \
             --create-namespace \
-            --set image.repository="${{ inputs.image_repo }}" \
+            --set image.repository="${{ needs.init.outputs.image_repo }}" \
             --set image.tag="${{ needs.init.outputs.image_tag }}" \
             --set environment="${{ inputs.env }}" \
             --set service.name="${{ inputs.service_name }}" \
