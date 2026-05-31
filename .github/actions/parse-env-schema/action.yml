@@ -70,6 +70,9 @@ inputs:
   replicas:
     description: "Initial replica count (becomes replicaCount)"
     default: "1"
+  cloud:
+    description: "aws | gcp | azure — only needed when .env.example contains K8S_OVERRIDE_* entries backed by a source ref that must be resolved at CI time."
+    default: ""
   secret_store:
     description: "ClusterSecretStore name for ${secret:…} entries"
     default: "cloud-default"
@@ -103,6 +106,12 @@ outputs:
   secret_count:
     description: "Number of secret entries (across all stores)"
     value: ${{ steps.parse.outputs.secret_count }}
+  override_count:
+    description: "Number of K8S_OVERRIDE_* entries injected into the values file"
+    value: ${{ steps.parse.outputs.override_count }}
+  namespace_override:
+    description: "Resolved value of K8S_OVERRIDE_NAMESPACE (when set) — the pipeline should pass this to helm --namespace"
+    value: ${{ steps.parse.outputs.namespace_override }}
   stores:
     description: "Comma-separated list of distinct ClusterSecretStore names referenced"
     value: ${{ steps.parse.outputs.stores }}
@@ -135,6 +144,7 @@ runs:
         IMAGE_TAG:     ${{ inputs.image_tag }}
         SERVICE_PORT:  ${{ inputs.service_port }}
         REPLICAS:      ${{ inputs.replicas }}
+        CLOUD:         ${{ inputs.cloud }}
       run: |
         python3 - <<'PY'
         import os, re, json, pathlib, yaml
@@ -163,12 +173,120 @@ runs:
 
             param_sources = {"param", "ssm"}
             ref_re = re.compile(r"^\$\{(?P<src>[a-z0-9_-]+):(?P<path>[^}#]+)(?:#(?P<field>[^}]+))?\}$")
+
+            # ── K8S_OVERRIDE_* support ─────────────────────────────────
+            # KEY in .env.example that starts with K8S_OVERRIDE_ doesn't go
+            # into the running pod's env. Instead its value is resolved at
+            # CI time and injected into the helm values file at the mapped
+            # path. That lets a service author tune chart values via the
+            # same schema mechanism, including pulling secrets from SSM /
+            # Secret Manager / Vault.
+            #
+            # Convention:  K8S_OVERRIDE_REPLICAS=3                     → replicaCount = 3
+            #              K8S_OVERRIDE_REPLICAS=${ssm:foo/bar}        → fetch from cloud at CI, then set
+            #              K8S_OVERRIDE_NAMESPACE=team-x               → namespace (used by pipeline)
+            #
+            # Mapping table — extend as the chart grows.
+            override_map = {
+                "REPLICAS":                  "replicaCount",
+                "NAMESPACE":                 "_namespace",   # consumed by pipeline, not chart
+                "IMAGE_TAG":                 "image.tag",
+                "IMAGE_REPOSITORY":          "image.repository",
+                "IMAGE_PULL_POLICY":         "image.pullPolicy",
+                "SERVICE_PORT":              "service.port",
+                "SCHEDULE":                  "schedule",
+                "TIMEZONE":                  "timeZone",
+                "AUTOSCALING_ENABLED":       "autoscaling.enabled",
+                "AUTOSCALING_MIN":           "autoscaling.minReplicas",
+                "AUTOSCALING_MAX":           "autoscaling.maxReplicas",
+                "AUTOSCALING_CPU":           "autoscaling.targetCPUUtilizationPercentage",
+                "RESOURCES_REQUESTS_CPU":    "resources.requests.cpu",
+                "RESOURCES_REQUESTS_MEMORY": "resources.requests.memory",
+                "RESOURCES_LIMITS_CPU":      "resources.limits.cpu",
+                "RESOURCES_LIMITS_MEMORY":   "resources.limits.memory",
+                "PRIORITY_CLASS":            "priorityClassName",
+                "REFRESH_INTERVAL":          "externalSecretRefreshInterval",
+            }
+
+            def resolve_ref_at_ci_time(src, raw, field):
+                """Fetch a secret/param value via the cloud's CLI at CI time."""
+                import subprocess
+                cloud = (os.environ.get("CLOUD") or "").lower()
+                full_path = raw if src == "vault" else f"{prefix}/{raw}"
+                try:
+                    if src in ("secret",):
+                        if cloud == "gcp":
+                            out = subprocess.check_output(["gcloud", "secrets", "versions", "access", "latest", "--secret", full_path.replace("/", "-")], text=True)
+                        elif cloud == "aws":
+                            out = subprocess.check_output(["aws", "secretsmanager", "get-secret-value", "--secret-id", full_path, "--query", "SecretString", "--output", "text"], text=True)
+                        elif cloud == "azure":
+                            out = subprocess.check_output(["az", "keyvault", "secret", "show", "--name", full_path.replace("/", "-").split("-")[-1], "--query", "value", "--output", "tsv"], text=True)
+                        else:
+                            raise RuntimeError(f"K8S_OVERRIDE_* with source={src} requires `cloud` input set")
+                    elif src in ("param", "ssm"):
+                        if cloud == "aws":
+                            out = subprocess.check_output(["aws", "ssm", "get-parameter", "--name", f"/{full_path}", "--with-decryption", "--query", "Parameter.Value", "--output", "text"], text=True)
+                        elif cloud == "gcp":
+                            # GCP doesn't have Parameter Store — falls back to Secret Manager
+                            out = subprocess.check_output(["gcloud", "secrets", "versions", "access", "latest", "--secret", full_path.replace("/", "-")], text=True)
+                        else:
+                            raise RuntimeError(f"Cloud {cloud!r} has no Parameter Store equivalent for K8S_OVERRIDE_*")
+                    elif src == "vault":
+                        out = subprocess.check_output(["vault", "kv", "get", "-field", field or "value", raw], text=True)
+                    else:
+                        raise RuntimeError(f"Unknown source {src!r} for K8S_OVERRIDE_*")
+                    out = out.strip()
+                    if field and src != "vault":
+                        # JSON secret — extract the field
+                        try:
+                            out = str(json.loads(out)[field])
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                    return out
+                except subprocess.CalledProcessError as e:
+                    raise RuntimeError(f"Failed to resolve K8S_OVERRIDE source {src}:{raw} — {e}")
+
+            def set_nested(d, dot_path, value):
+                parts = dot_path.split(".")
+                for p in parts[:-1]:
+                    d = d.setdefault(p, {})
+                # Coerce numeric strings to int/float so YAML emits typed values
+                try:
+                    if value in ("true", "false"): value = value == "true"
+                    elif "." in value:             value = float(value)
+                    else:                          value = int(value)
+                except (ValueError, AttributeError, TypeError):
+                    pass
+                d[parts[-1]] = value
+
+            overrides = {}            # dotted-path → resolved value
+            override_namespace = None  # consumed by pipeline; not chart
+
             for line in schema_text.splitlines():
                 s = line.strip()
                 if not s or s.startswith("#") or "=" not in s:
                     continue
                 key, val = s.split("=", 1)
                 key, val = key.strip(), val.strip()
+
+                # ── K8S_OVERRIDE_* — resolved at CI time, injected into values ──
+                if key.startswith("K8S_OVERRIDE_"):
+                    suffix = key[len("K8S_OVERRIDE_"):]
+                    helm_path = override_map.get(suffix)
+                    if not helm_path:
+                        print(f"::warning title=Unknown K8S_OVERRIDE::{key} — not in override map; ignored")
+                        continue
+                    m = ref_re.match(val)
+                    if m:
+                        resolved = resolve_ref_at_ci_time(m.group("src"), m.group("path"), m.group("field"))
+                    else:
+                        resolved = val
+                    if helm_path == "_namespace":
+                        override_namespace = resolved
+                    else:
+                        set_nested(overrides, helm_path, resolved)
+                    continue
+
                 m = ref_re.match(val)
                 if not m:
                     literals[key] = val
@@ -186,6 +304,8 @@ runs:
         else:
             if schema_path:
                 print(f"::notice title=🔐 No schema::{schema_path} absent — emitting identity-only values")
+            overrides = {}
+            override_namespace = None
 
         store_set = sorted({e["store"] for e in (*params, *secrets)})
 
@@ -200,6 +320,17 @@ runs:
                 "repository": os.environ.get("IMAGE_REPO", ""),
                 "tag":        os.environ.get("IMAGE_TAG", "latest"),
             }
+
+        # ── K8S_OVERRIDE_* — deep-merge resolved values on top of identity
+        def deep_merge(dst, src):
+            for k, v in src.items():
+                if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                    deep_merge(dst[k], v)
+                else:
+                    dst[k] = v
+        if overrides:
+            deep_merge(out, overrides)
+
         # ── Schema-derived blocks (only when we parsed something)
         if schema_seen:
             out["envLiterals"]     = literals
@@ -221,6 +352,8 @@ runs:
             fh.write(f"literal_count={len(literals)}\n")
             fh.write(f"param_count={len(params)}\n")
             fh.write(f"secret_count={len(secrets)}\n")
+            fh.write(f"override_count={len(overrides)}\n")
+            fh.write(f"namespace_override={override_namespace or ''}\n")
             fh.write(f"stores={','.join(store_set)}\n")
         PY
 

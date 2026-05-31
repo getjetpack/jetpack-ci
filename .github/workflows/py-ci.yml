@@ -517,6 +517,7 @@ jobs:
           domain:           ${{ inputs.domain }}
           service_name:     ${{ inputs.service_name }}
           env:              ${{ inputs.env }}
+          cloud:            ${{ inputs.cloud }}
           schema_file:      ${{ inputs.env_schema_file }}
           image_repository: ${{ needs.init.outputs.image_repo }}
           image_tag:        ${{ needs.init.outputs.image_tag }}
@@ -558,7 +559,9 @@ jobs:
       - name: "🚀 helm upgrade --install"
         id: helm
         env:
-          NS:           ${{ needs.init.outputs.namespace }}
+          # K8S_OVERRIDE_NAMESPACE in .env.example wins; otherwise the init
+          # job's default (env or domain) is used.
+          NS:           ${{ steps.values.outputs.namespace_override || needs.init.outputs.namespace }}
           VALUES_FILE:  ${{ steps.values.outputs.values_file }}
           CHART_PATH:   ${{ steps.chart.outputs.path }}
           EXTRA_VALUES: ${{ inputs.helm_values_file }}

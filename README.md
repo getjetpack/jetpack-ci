@@ -236,14 +236,54 @@ Every service repo declares its env vars in **one schema file** — `.env.exampl
 
 ```bash
 # .env.example  (the contract — committed to git, no real values)
+
+# ── Runtime env vars (injected via ConfigMap / ExternalSecret at pod start)
 DATABASE_URL=${secret:db/url}              # whole opaque secret
 JWT_SIGNING=${secret:auth/jwt#signing-key} # one field from a structured secret
 API_KEY=${vault:secret/data/stripe}        # HashiCorp Vault — path passed through
 LOG_LEVEL=${param:log-level}               # non-sensitive — Parameter Store / ConfigMap
 SERVICE_PORT=8080                          # literal default — goes into ConfigMap
+
+# ── Chart-value overrides (resolved at CI time, injected into helm values)
+K8S_OVERRIDE_REPLICAS=3                                    # literal
+K8S_OVERRIDE_REPLICAS=${ssm:test-service/k8s#replicas}     # from SSM at CI time
+K8S_OVERRIDE_NAMESPACE=team-x                              # routed to helm --namespace
+K8S_OVERRIDE_RESOURCES_LIMITS_CPU=500m                     # nested chart value
+K8S_OVERRIDE_AUTOSCALING_MAX=${param:hpa/max-replicas}     # from Parameter Store
+K8S_OVERRIDE_SCHEDULE="0 3 * * *"                          # CronJob schedule (job chart)
 ```
 
+**Two distinct mechanisms in one schema file:**
+
+1. **Runtime env vars** — anything else. Lands in ConfigMap (literals + `${param:…}`) or ExternalSecret (`${secret:…}` / `${vault:…}`). Materialised by External Secrets Operator inside the cluster.
+2. **`K8S_OVERRIDE_*` chart values** — resolved at CI time by the action calling the cloud's CLI (`aws ssm get-parameter`, `gcloud secrets versions access`, etc.), then injected into the helm values file at the mapped path. Used to tune chart behaviour (replica count, resources, schedule) without touching the deploy workflow.
+
 The **source prefix is the backend** — extensible to anything ESO supports (1Password, Doppler, Infisical, …). Add a new prefix → add a row to the workflow's `*_store_default` inputs and ESO does the rest.
+
+### `K8S_OVERRIDE_*` mapping
+
+| `.env.example` key | Helm value path |
+|---|---|
+| `K8S_OVERRIDE_REPLICAS` | `replicaCount` |
+| `K8S_OVERRIDE_NAMESPACE` | (passes to `helm --namespace`, not values) |
+| `K8S_OVERRIDE_IMAGE_TAG` | `image.tag` |
+| `K8S_OVERRIDE_IMAGE_REPOSITORY` | `image.repository` |
+| `K8S_OVERRIDE_IMAGE_PULL_POLICY` | `image.pullPolicy` |
+| `K8S_OVERRIDE_SERVICE_PORT` | `service.port` |
+| `K8S_OVERRIDE_SCHEDULE` | `schedule` |
+| `K8S_OVERRIDE_TIMEZONE` | `timeZone` |
+| `K8S_OVERRIDE_AUTOSCALING_ENABLED` | `autoscaling.enabled` |
+| `K8S_OVERRIDE_AUTOSCALING_MIN` | `autoscaling.minReplicas` |
+| `K8S_OVERRIDE_AUTOSCALING_MAX` | `autoscaling.maxReplicas` |
+| `K8S_OVERRIDE_AUTOSCALING_CPU` | `autoscaling.targetCPUUtilizationPercentage` |
+| `K8S_OVERRIDE_RESOURCES_REQUESTS_CPU` | `resources.requests.cpu` |
+| `K8S_OVERRIDE_RESOURCES_REQUESTS_MEMORY` | `resources.requests.memory` |
+| `K8S_OVERRIDE_RESOURCES_LIMITS_CPU` | `resources.limits.cpu` |
+| `K8S_OVERRIDE_RESOURCES_LIMITS_MEMORY` | `resources.limits.memory` |
+| `K8S_OVERRIDE_PRIORITY_CLASS` | `priorityClassName` |
+| `K8S_OVERRIDE_REFRESH_INTERVAL` | `externalSecretRefreshInterval` |
+
+Unknown `K8S_OVERRIDE_*` keys emit a warning and are ignored.
 
 ### Path composition
 
