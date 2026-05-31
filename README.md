@@ -149,6 +149,39 @@ No service repo changes required — they just start passing `cloud: oracle`.
 
 ---
 
+## Composite actions
+
+Reusable steps that the per-stack pipelines (and any caller) drop in directly:
+
+| Action | Purpose |
+|---|---|
+| `.github/actions/parse-env-schema` | Reads a service's `.env.example`, composes paths, emits a helm values file driving ConfigMap + ExternalSecret. Stack-agnostic — same step in `py-ci.yml`, `nodejs-ci.yml`, `java-ci.yml`, `go-ci.yml`. |
+
+Usage from any workflow:
+
+```yaml
+- uses: getjetpack/jetpack-ci/.github/actions/parse-env-schema@main
+  id: schema
+  with:
+    organization: testa
+    project_name: gcp
+    domain: users
+    service_name: user-service
+    env: dev
+    # Optional defaults:
+    schema_file: .env.example
+    secret_store: cloud-default
+    param_store: param-default
+    vault_store: vault-default
+    extra_store_map: '{"doppler":"doppler-default"}'
+
+- run: helm upgrade --install svc ./helm --values ${{ steps.schema.outputs.values_file }}
+```
+
+Outputs: `values_file`, `skipped`, `literal_count`, `param_count`, `secret_count`, `stores`.
+
+---
+
 ## 🔐 Secrets & config schema (`.env.example`)
 
 Every service repo declares its env vars in **one schema file** — `.env.example` — using source-prefixed references. The deploy job parses it, composes the cloud-specific paths, and feeds the result into helm as `--values`.
