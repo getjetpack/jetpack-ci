@@ -1,10 +1,18 @@
-name: "🔐 Parse env schema"
+name: "🔐 Compose helm values"
 description: |
-  Reusable composite action: reads a service's .env.example file, composes
-  cloud-agnostic paths into the project-wide convention, and emits a helm
-  values file driving ConfigMap + ExternalSecret generation. Cloud-agnostic
-  and stack-agnostic — used by py-ci.yml today, will be reused by
-  nodejs-ci.yml / java-ci.yml / go-ci.yml.
+  Reusable composite action: produces a single helm-values YAML file the
+  pipeline can pass via `helm upgrade --values`. The file combines two
+  kinds of input:
+
+    1. Service identity (service.name, image.repository, image.tag,
+       environment, replicaCount, …) so the helm step needs zero --set
+       flags.
+    2. Schema-driven env injection parsed from .env.example — emits
+       envLiterals / envParams / envSecrets / secretStoreRefs in the
+       shape the shared app/job charts consume.
+
+  Cloud-agnostic and stack-agnostic — used by py-ci.yml today, reused by
+  nodejs-ci.yml / java-ci.yml / go-ci.yml as they land.
 
   Schema syntax (in the service repo's .env.example):
     KEY=literal-default                       → ConfigMap data
@@ -43,11 +51,25 @@ inputs:
     description: "Environment — third segment (dev / staging / prod)"
     required: true
   schema_file:
-    description: "Path to the .env.example file"
+    description: "Path to the .env.example file — pass '' to skip schema parsing and emit only identity"
     default: ".env.example"
   output_file:
     description: "Path to write the generated helm values YAML"
     default: "/tmp/values-env.yaml"
+
+  # ── Identity injected into the values file (no --set flags needed) ───
+  image_repository:
+    description: "Container image repo (no tag). Becomes image.repository in the values."
+    default: ""
+  image_tag:
+    description: "Container image tag. Becomes image.tag."
+    default: ""
+  service_port:
+    description: "Container port (becomes service.port)"
+    default: "8080"
+  replicas:
+    description: "Initial replica count (becomes replicaCount)"
+    default: "1"
   secret_store:
     description: "ClusterSecretStore name for ${secret:…} entries"
     default: "cloud-default"
@@ -94,105 +116,107 @@ runs:
         python3 -m pip install --user --quiet pyyaml 2>/dev/null \
           || python3 -m pip install --user --quiet --break-system-packages pyyaml
 
-    - name: "🔐 Parse schema"
+    - name: "📝 Compose values file"
       id: parse
       shell: bash
       env:
-        ORG:          ${{ inputs.organization }}
-        PROJECT:      ${{ inputs.project_name }}
-        DOMAIN:       ${{ inputs.domain }}
-        SERVICE:      ${{ inputs.service_name }}
-        ENVIRON:      ${{ inputs.env }}
-        SCHEMA:       ${{ inputs.schema_file }}
-        OUTPUT:       ${{ inputs.output_file }}
-        STORE_SEC:    ${{ inputs.secret_store }}
-        STORE_PRM:    ${{ inputs.param_store }}
-        STORE_VLT:    ${{ inputs.vault_store }}
-        EXTRA_STORES: ${{ inputs.extra_store_map }}
+        ORG:           ${{ inputs.organization }}
+        PROJECT:       ${{ inputs.project_name }}
+        DOMAIN:        ${{ inputs.domain }}
+        SERVICE:       ${{ inputs.service_name }}
+        ENVIRON:       ${{ inputs.env }}
+        SCHEMA:        ${{ inputs.schema_file }}
+        OUTPUT:        ${{ inputs.output_file }}
+        STORE_SEC:     ${{ inputs.secret_store }}
+        STORE_PRM:     ${{ inputs.param_store }}
+        STORE_VLT:     ${{ inputs.vault_store }}
+        EXTRA_STORES:  ${{ inputs.extra_store_map }}
+        IMAGE_REPO:    ${{ inputs.image_repository }}
+        IMAGE_TAG:     ${{ inputs.image_tag }}
+        SERVICE_PORT:  ${{ inputs.service_port }}
+        REPLICAS:      ${{ inputs.replicas }}
       run: |
-        if [ ! -f "$SCHEMA" ]; then
-          echo "::notice title=🔐 No schema::$SCHEMA absent — no env values to generate"
-          {
-            echo "skipped=true"
-            echo "values_file="
-            echo "literal_count=0"
-            echo "param_count=0"
-            echo "secret_count=0"
-            echo "stores="
-          } >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
         python3 - <<'PY'
-        import os, re, json, pathlib, yaml, sys
+        import os, re, json, pathlib, yaml
 
-        schema_text = pathlib.Path(os.environ["SCHEMA"]).read_text()
-        prefix      = f"{os.environ['ORG']}/{os.environ['PROJECT']}/{os.environ['ENVIRON']}/{os.environ['DOMAIN']}/{os.environ['SERVICE']}"
+        prefix = f"{os.environ['ORG']}/{os.environ['PROJECT']}/{os.environ['ENVIRON']}/{os.environ['DOMAIN']}/{os.environ['SERVICE']}"
 
-        # Well-known source prefix → ClusterSecretStore name.
-        # Vault paths pass through; everything else gets the prefix-composed path.
-        stores = {
-            "secret": os.environ["STORE_SEC"],
-            "param":  os.environ["STORE_PRM"],
-            "ssm":    os.environ["STORE_PRM"],
-            "vault":  os.environ["STORE_VLT"],
-        }
-        # Caller-supplied extras (e.g. {"doppler":"doppler-default"})
-        try:
-            extras = json.loads(os.environ.get("EXTRA_STORES") or "{}")
-            for k, v in extras.items():
-                stores[k] = v
-        except json.JSONDecodeError as e:
-            print(f"::warning title=Bad extra_store_map::{e}")
-
-        # Classify each parsed entry as a "param" (goes into ConfigMap, low-sensitivity)
-        # or a "secret" (goes into ExternalSecret). Vault is always treated as secret.
-        param_sources = {"param", "ssm"}
-
-        ref_re   = re.compile(r"^\$\{(?P<src>[a-z0-9_-]+):(?P<path>[^}#]+)(?:#(?P<field>[^}]+))?\}$")
+        # ── Schema parsing (optional — skipped if file absent or path empty)
+        schema_path = os.environ.get("SCHEMA", "").strip()
         literals, params, secrets = {}, [], []
-        for line in schema_text.splitlines():
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            key, val = s.split("=", 1)
-            key = key.strip()
-            val = val.strip()
-            m = ref_re.match(val)
-            if not m:
-                # No source prefix → literal default
-                literals[key] = val
-                continue
-            src   = m.group("src")
-            raw   = m.group("path")
-            field = m.group("field")
-            # Vault paths are passed through; everything else gets the project prefix
-            path  = raw if src == "vault" else f"{prefix}/{raw}"
-            store = stores.get(src, os.environ["STORE_SEC"])
-            entry = {"key": key, "source": src, "path": path, "store": store}
-            if field:
-                entry["field"] = field
-            (params if src in param_sources else secrets).append(entry)
+        schema_seen = False
+        if schema_path and pathlib.Path(schema_path).is_file():
+            schema_seen = True
+            schema_text = pathlib.Path(schema_path).read_text()
+
+            stores = {
+                "secret": os.environ["STORE_SEC"],
+                "param":  os.environ["STORE_PRM"],
+                "ssm":    os.environ["STORE_PRM"],
+                "vault":  os.environ["STORE_VLT"],
+            }
+            try:
+                extras = json.loads(os.environ.get("EXTRA_STORES") or "{}")
+                stores.update(extras)
+            except json.JSONDecodeError as e:
+                print(f"::warning title=Bad extra_store_map::{e}")
+
+            param_sources = {"param", "ssm"}
+            ref_re = re.compile(r"^\$\{(?P<src>[a-z0-9_-]+):(?P<path>[^}#]+)(?:#(?P<field>[^}]+))?\}$")
+            for line in schema_text.splitlines():
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                key, val = s.split("=", 1)
+                key, val = key.strip(), val.strip()
+                m = ref_re.match(val)
+                if not m:
+                    literals[key] = val
+                    continue
+                src   = m.group("src")
+                raw   = m.group("path")
+                field = m.group("field")
+                # Vault paths are passed through; everything else gets the project prefix
+                path  = raw if src == "vault" else f"{prefix}/{raw}"
+                store = stores.get(src, os.environ["STORE_SEC"])
+                entry = {"key": key, "source": src, "path": path, "store": store}
+                if field:
+                    entry["field"] = field
+                (params if src in param_sources else secrets).append(entry)
+        else:
+            if schema_path:
+                print(f"::notice title=🔐 No schema::{schema_path} absent — emitting identity-only values")
 
         store_set = sorted({e["store"] for e in (*params, *secrets)})
 
+        # ── Identity (always emitted; chart needs at minimum service.name + image)
         out = {
-            "envLiterals":     literals,
-            "envParams":       params,
-            "envSecrets":      secrets,
-            "secretStoreRefs": store_set,
+            "service":     {"name": os.environ["SERVICE"], "port": int(os.environ.get("SERVICE_PORT") or 8080)},
+            "environment": os.environ["ENVIRON"],
+            "replicaCount": int(os.environ.get("REPLICAS") or 1),
         }
+        if os.environ.get("IMAGE_REPO") or os.environ.get("IMAGE_TAG"):
+            out["image"] = {
+                "repository": os.environ.get("IMAGE_REPO", ""),
+                "tag":        os.environ.get("IMAGE_TAG", "latest"),
+            }
+        # ── Schema-derived blocks (only when we parsed something)
+        if schema_seen:
+            out["envLiterals"]     = literals
+            out["envParams"]       = params
+            out["envSecrets"]      = secrets
+            out["secretStoreRefs"] = store_set
+
         out_path = pathlib.Path(os.environ["OUTPUT"])
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(yaml.safe_dump(out, sort_keys=False))
 
-        print("───── values-env.yaml ─────")
+        print("───── composed values.yaml ─────")
         print(out_path.read_text())
-        print("───────────────────────────")
+        print("─────────────────────────────────")
 
-        # Job outputs
-        gh_out = os.environ["GITHUB_OUTPUT"]
-        with open(gh_out, "a") as fh:
-            fh.write(f"skipped=false\n")
+        with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+            fh.write(f"skipped={'false' if schema_seen else 'no-schema'}\n")
             fh.write(f"values_file={out_path}\n")
             fh.write(f"literal_count={len(literals)}\n")
             fh.write(f"param_count={len(params)}\n")
@@ -202,7 +226,7 @@ runs:
 
     - name: "📊 Schema summary"
       shell: bash
-      if: steps.parse.outputs.skipped == 'false'
+      if: steps.parse.outputs.skipped != 'no-schema'
       run: |
         {
           echo "### 🔐 Env schema"

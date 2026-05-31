@@ -508,20 +508,21 @@ jobs:
           esac
           kubectl config current-context
 
-      - name: "🔐 Parse .env.example → values-env.yaml"
-        id: schema
-        if: inputs.env_schema_file != ''
+      - name: "📝 Compose helm values"
+        id: values
         uses: getjetpack/jetpack-ci/.github/actions/parse-env-schema@main
         with:
-          organization: ${{ inputs.organization }}
-          project_name: ${{ inputs.project_name }}
-          domain:       ${{ inputs.domain }}
-          service_name: ${{ inputs.service_name }}
-          env:          ${{ inputs.env }}
-          schema_file:  ${{ inputs.env_schema_file }}
-          secret_store: ${{ inputs.secret_store_default }}
-          param_store:  ${{ inputs.param_store_default }}
-          vault_store:  ${{ inputs.vault_store_default }}
+          organization:     ${{ inputs.organization }}
+          project_name:     ${{ inputs.project_name }}
+          domain:           ${{ inputs.domain }}
+          service_name:     ${{ inputs.service_name }}
+          env:              ${{ inputs.env }}
+          schema_file:      ${{ inputs.env_schema_file }}
+          image_repository: ${{ needs.init.outputs.image_repo }}
+          image_tag:        ${{ needs.init.outputs.image_tag }}
+          secret_store:     ${{ inputs.secret_store_default }}
+          param_store:      ${{ inputs.param_store_default }}
+          vault_store:      ${{ inputs.vault_store_default }}
 
       - name: "📚 Checkout helm charts library"
         if: inputs.helm_chart_override == ''
@@ -558,27 +559,21 @@ jobs:
         id: helm
         env:
           NS:           ${{ needs.init.outputs.namespace }}
-          VALUES_FILE:  ${{ steps.schema.outputs.values_file }}
+          VALUES_FILE:  ${{ steps.values.outputs.values_file }}
           CHART_PATH:   ${{ steps.chart.outputs.path }}
           EXTRA_VALUES: ${{ inputs.helm_values_file }}
         run: |
-          # Build the list of --values flags in priority order (last wins):
-          #   1. schema-derived values from parse-env-schema (low priority)
-          #   2. caller-supplied extra values file (overrides chart defaults)
-          VALUES_ARGS=""
-          if [ -n "$VALUES_FILE" ] && [ -f "$VALUES_FILE" ]; then
-            VALUES_ARGS="$VALUES_ARGS --values $VALUES_FILE"
-          fi
+          # Single composed values file from the compose-helm-values action
+          # carries identity (service.name, image.repository/tag, environment,
+          # replicaCount) + schema-derived envLiterals/envParams/envSecrets.
+          # Layer caller's extras file on top (wins over chart defaults).
+          VALUES_ARGS="--values $VALUES_FILE"
           if [ -n "$EXTRA_VALUES" ] && [ -f "$EXTRA_VALUES" ]; then
             VALUES_ARGS="$VALUES_ARGS --values $EXTRA_VALUES"
           fi
           helm upgrade --install "${{ inputs.service_name }}" "$CHART_PATH" \
             --namespace "$NS" \
             --create-namespace \
-            --set image.repository="${{ needs.init.outputs.image_repo }}" \
-            --set image.tag="${{ needs.init.outputs.image_tag }}" \
-            --set environment="${{ inputs.env }}" \
-            --set service.name="${{ inputs.service_name }}" \
             $VALUES_ARGS \
             --wait \
             --atomic \

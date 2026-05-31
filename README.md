@@ -197,27 +197,31 @@ Reusable steps that the per-stack pipelines (and any caller) drop in directly:
 
 | Action | Purpose |
 |---|---|
-| `.github/actions/parse-env-schema` | Reads a service's `.env.example`, composes paths, emits a helm values file driving ConfigMap + ExternalSecret. Stack-agnostic — same step in `py-ci.yml`, `nodejs-ci.yml`, `java-ci.yml`, `go-ci.yml`. |
+| `.github/actions/parse-env-schema` | Composes one helm values file with service identity (`service.name`, `image.*`, `environment`, `replicaCount`) **and** schema-derived ConfigMap + ExternalSecret values from `.env.example`. Stack-agnostic — same step in `py-ci.yml`, `nodejs-ci.yml`, `java-ci.yml`, `go-ci.yml`. Lets the helm step drop **every `--set` flag**. |
 
 Usage from any workflow:
 
 ```yaml
 - uses: getjetpack/jetpack-ci/.github/actions/parse-env-schema@main
-  id: schema
+  id: values
   with:
-    organization: testa
-    project_name: gcp
-    domain: users
-    service_name: user-service
-    env: dev
-    # Optional defaults:
-    schema_file: .env.example
+    organization:     testa
+    project_name:     gcp
+    domain:           users
+    service_name:     user-service
+    env:              dev
+    image_repository: us-west2-docker.pkg.dev/testa/gcp/users/user-service
+    image_tag:        ${{ github.sha }}
+    # Optional:
+    schema_file:  .env.example         # default; pass '' to emit identity only
+    service_port: 8080
+    replicas:     1
     secret_store: cloud-default
-    param_store: param-default
-    vault_store: vault-default
+    param_store:  param-default
+    vault_store:  vault-default
     extra_store_map: '{"doppler":"doppler-default"}'
 
-- run: helm upgrade --install svc ./helm --values ${{ steps.schema.outputs.values_file }}
+- run: helm upgrade --install svc ./helm --values ${{ steps.values.outputs.values_file }}
 ```
 
 Outputs: `values_file`, `skipped`, `literal_count`, `param_count`, `secret_count`, `stores`.
