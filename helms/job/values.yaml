@@ -1,0 +1,58 @@
+# ── Identity ─────────────────────────────────────────────────────────────
+service:
+  name: "default-job"
+environment: dev
+
+# ── Image ────────────────────────────────────────────────────────────────
+image:
+  repository: ""
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# ── Job behaviour ────────────────────────────────────────────────────────
+# Empty → one-shot Job. Non-empty (cron expression) → CronJob.
+schedule: ""
+timeZone: ""                  # CronJob only — defaults to cluster TZ
+suspend: false
+backoffLimit: 3
+activeDeadlineSeconds: 0       # 0 = unlimited
+ttlSecondsAfterFinished: 3600  # auto-cleanup after 1h
+concurrencyPolicy: Forbid      # CronJob only — Allow | Forbid | Replace
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 1
+restartPolicy: OnFailure       # Job container restart policy
+
+# Optional command / args override
+command: []                    # e.g. ["python"]
+args: []                       # e.g. ["worker.py", "--queue", "default"]
+
+# ── Resources (cheapest viable defaults) ─────────────────────────────────
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# ── ServiceAccount + Workload Identity ──────────────────────────────────
+serviceAccount:
+  create: true
+  annotations: {}
+
+# ── Schema-driven env injection (same shape as app chart) ───────────────
+envLiterals: {}
+envParams: []
+envSecrets: []
+secretStoreRefs: []
+
+externalSecretRefreshInterval: 1h
+
+# ── Pod-level extras ─────────────────────────────────────────────────────
+podLabels: {}
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+imagePullSecrets: []

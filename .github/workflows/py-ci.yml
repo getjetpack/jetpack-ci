@@ -68,7 +68,9 @@ on:
       # ── ⚓ cluster ──────────────────────────────────────────────────────
       cluster_name:                   { description: "Target Kubernetes cluster name",                                    required: true, type: string }
       cluster_location:               { description: "Region/zone for k8s (EKS/GKE) or resource group (AKS)",             required: true, type: string }
-      chart_path:                     { description: "Helm chart directory inside the repo",                              default: "./helm", type: string }
+      helm_type:                      { description: "Chart from getjetpack/jetpack-ci/helms/<type>: app | job",          default: "app", type: string }
+      helm_chart_override:            { description: "Optional. Path inside the service repo to a custom chart (wins over helm_type).", default: "", type: string }
+      helm_values_file:               { description: "Optional extra values file inside the service repo (passed last so it wins over chart defaults).", default: "", type: string }
       namespace:                      { description: "K8s namespace — defaults to `domain` so all services in the same domain share a namespace", default: "", type: string }
       helm_timeout:                   { description: "Helm rollout timeout (e.g. 5m, 10m)",                               default: "5m", type: string }
 
@@ -521,29 +523,63 @@ jobs:
           param_store:  ${{ inputs.param_store_default }}
           vault_store:  ${{ inputs.vault_store_default }}
 
+      - name: "📚 Checkout helm charts library"
+        if: inputs.helm_chart_override == ''
+        uses: actions/checkout@v4
+        with:
+          repository: getjetpack/jetpack-ci
+          ref: main
+          path: .jetpack-ci-charts
+          sparse-checkout: helms
+          sparse-checkout-cone-mode: false
+
       - name: "⚓ Setup Helm"
         uses: azure/setup-helm@v4
         with:
           version: "v3.14.0"
 
+      - name: "🧭 Resolve chart path"
+        id: chart
+        run: |
+          if [ -n "${{ inputs.helm_chart_override }}" ]; then
+            PATH_OUT="${{ inputs.helm_chart_override }}"
+            echo "::notice title=📚 Chart::override → $PATH_OUT"
+          else
+            PATH_OUT=".jetpack-ci-charts/helms/${{ inputs.helm_type }}"
+            echo "::notice title=📚 Chart::library → $PATH_OUT"
+          fi
+          if [ ! -f "$PATH_OUT/Chart.yaml" ]; then
+            echo "::error title=📚 Chart not found::no Chart.yaml at $PATH_OUT"
+            exit 1
+          fi
+          echo "path=$PATH_OUT" >> "$GITHUB_OUTPUT"
+
       - name: "🚀 helm upgrade --install"
         id: helm
         env:
-          NS: ${{ needs.init.outputs.namespace }}
-          VALUES_FILE: ${{ steps.schema.outputs.values_file }}
+          NS:           ${{ needs.init.outputs.namespace }}
+          VALUES_FILE:  ${{ steps.schema.outputs.values_file }}
+          CHART_PATH:   ${{ steps.chart.outputs.path }}
+          EXTRA_VALUES: ${{ inputs.helm_values_file }}
         run: |
-          EXTRA_VALUES=""
+          # Build the list of --values flags in priority order (last wins):
+          #   1. schema-derived values from parse-env-schema (low priority)
+          #   2. caller-supplied extra values file (overrides chart defaults)
+          VALUES_ARGS=""
           if [ -n "$VALUES_FILE" ] && [ -f "$VALUES_FILE" ]; then
-            EXTRA_VALUES="--values $VALUES_FILE"
+            VALUES_ARGS="$VALUES_ARGS --values $VALUES_FILE"
           fi
-          helm upgrade --install "${{ inputs.service_name }}" "${{ inputs.chart_path }}" \
+          if [ -n "$EXTRA_VALUES" ] && [ -f "$EXTRA_VALUES" ]; then
+            VALUES_ARGS="$VALUES_ARGS --values $EXTRA_VALUES"
+          fi
+          helm upgrade --install "${{ inputs.service_name }}" "$CHART_PATH" \
             --namespace "$NS" \
             --create-namespace \
             --set image.repository="${{ needs.init.outputs.image_repo }}" \
             --set image.tag="${{ needs.init.outputs.image_tag }}" \
             --set environment="${{ inputs.env }}" \
             --set service.name="${{ inputs.service_name }}" \
-            $EXTRA_VALUES \
+            $VALUES_ARGS \
             --wait \
             --atomic \
             --timeout "${{ inputs.helm_timeout }}"

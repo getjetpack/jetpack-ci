@@ -1,0 +1,12 @@
+{{- if .Values.envLiterals -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.service.name }}-config
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+data:
+  {{- range $k, $v := .Values.envLiterals }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+{{- end }}

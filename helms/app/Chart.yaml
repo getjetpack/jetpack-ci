@@ -1,0 +1,14 @@
+apiVersion: v2
+name: app
+description: |
+  Generic application chart for long-running Jetpack services.
+  Renders Deployment + Service + ServiceAccount + ConfigMap (literals) +
+  one ExternalSecret per unique ClusterSecretStore referenced.
+
+  Consumed by per-stack pipelines (py-ci.yml, nodejs-ci.yml, …) via the
+  `helm_type: app` input. Pair with the parse-env-schema composite action
+  to drive envLiterals / envParams / envSecrets / secretStoreRefs from a
+  service's .env.example.
+type: application
+version: 0.1.0
+appVersion: "1.0"

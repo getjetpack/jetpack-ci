@@ -149,6 +149,48 @@ No service repo changes required — they just start passing `cloud: oracle`.
 
 ---
 
+## ⛵ Helm charts library — `helms/`
+
+Shared, opinionated charts kept here so service repos don't carry boilerplate. The per-stack pipelines pick one via the `helm_type` input and clone the chart at deploy time (`actions/checkout` of this repo, sparse `helms/` only).
+
+| Chart | When to use | Renders |
+|---|---|---|
+| `helms/app` | Long-running services (HTTP / gRPC / consumers staying up) | Deployment + Service + ServiceAccount + optional HPA + ConfigMap + ExternalSecret |
+| `helms/job` | Batch workloads (one-shot scripts, scheduled cleanups, ETL) | Job *or* CronJob (auto-switched by `schedule:` value) + ServiceAccount + ConfigMap + ExternalSecret |
+
+Both charts share the same `envLiterals` / `envParams` / `envSecrets` / `secretStoreRefs` value shape, so the same `parse-env-schema` action drives either.
+
+### Picking a chart from the pipeline
+
+```yaml
+# Long-running web service — the default
+with:
+  helm_type: app
+
+# Batch / cron job
+with:
+  helm_type: job
+  # Then in service's own values file (passed via helm_values_file):
+  #   schedule: "0 3 * * *"       # daily 03:00 → CronJob; omit for one-shot Job
+```
+
+### Overriding the chart entirely
+
+If you need something the library doesn't cover, ship a chart inside the service repo and point at it:
+
+```yaml
+with:
+  helm_chart_override: ./deploy/custom-chart
+```
+
+The library is ignored and `./deploy/custom-chart` is used as-is.
+
+### Layering extra values
+
+The schema-derived values from `parse-env-schema` always go in first. Pass `helm_values_file: ./deploy/extras.yaml` to layer additional service-specific values on top — they win over chart defaults but lose to `--set` flags from the pipeline (image, tag, environment, service.name).
+
+---
+
 ## Composite actions
 
 Reusable steps that the per-stack pipelines (and any caller) drop in directly:

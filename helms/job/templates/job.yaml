@@ -1,0 +1,111 @@
+{{- /*
+Two-mode chart: when .Values.schedule is set, render a CronJob; otherwise
+render a one-shot Job. PodSpec is identical between the two, so we factor
+it via a named template.
+*/}}
+{{- define "job.podSpec" -}}
+restartPolicy: {{ .Values.restartPolicy }}
+{{- if .Values.serviceAccount.create }}
+serviceAccountName: {{ .Values.service.name }}
+{{- end }}
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .Values.priorityClassName }}
+priorityClassName: {{ . }}
+{{- end }}
+containers:
+  - name: {{ .Values.service.name }}
+    image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+    imagePullPolicy: {{ .Values.image.pullPolicy }}
+    {{- with .Values.command }}
+    command: {{ toJson . }}
+    {{- end }}
+    {{- with .Values.args }}
+    args: {{ toJson . }}
+    {{- end }}
+    envFrom:
+      {{- if .Values.envLiterals }}
+      - configMapRef:
+          name: {{ .Values.service.name }}-config
+      {{- end }}
+      {{- range .Values.secretStoreRefs }}
+      - secretRef:
+          name: {{ $.Values.service.name }}-{{ . }}-env
+      {{- end }}
+    resources:
+      {{- toYaml .Values.resources | nindent 6 }}
+{{- with .Values.nodeSelector }}
+nodeSelector:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .Values.tolerations }}
+tolerations:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .Values.affinity }}
+affinity:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end -}}
+
+{{- if .Values.schedule -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Values.service.name }}
+  labels:
+    {{- include "job.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.schedule | quote }}
+  {{- with .Values.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  suspend: {{ .Values.suspend }}
+  concurrencyPolicy: {{ .Values.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.backoffLimit }}
+      {{- if gt (int .Values.activeDeadlineSeconds) 0 }}
+      activeDeadlineSeconds: {{ .Values.activeDeadlineSeconds }}
+      {{- end }}
+      ttlSecondsAfterFinished: {{ .Values.ttlSecondsAfterFinished }}
+      template:
+        metadata:
+          labels:
+            {{- include "job.labels" . | nindent 12 }}
+            {{- with .Values.podLabels }}{{- toYaml . | nindent 12 }}{{- end }}
+          {{- with .Values.podAnnotations }}
+          annotations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        spec:
+          {{- include "job.podSpec" . | nindent 10 }}
+{{- else -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Values.service.name }}
+  labels:
+    {{- include "job.labels" . | nindent 4 }}
+spec:
+  backoffLimit: {{ .Values.backoffLimit }}
+  {{- if gt (int .Values.activeDeadlineSeconds) 0 }}
+  activeDeadlineSeconds: {{ .Values.activeDeadlineSeconds }}
+  {{- end }}
+  ttlSecondsAfterFinished: {{ .Values.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "job.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- include "job.podSpec" . | nindent 6 }}
+{{- end }}

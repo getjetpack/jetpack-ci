@@ -1,0 +1,80 @@
+# ── Identity ─────────────────────────────────────────────────────────────
+service:
+  name: "default-app"          # set by the pipeline via --set service.name
+  port: 8080
+  protocol: TCP
+
+environment: dev               # set by the pipeline via --set environment
+
+# ── Image ────────────────────────────────────────────────────────────────
+image:
+  repository: ""               # set by the pipeline via --set image.repository
+  tag: latest                  # set by the pipeline via --set image.tag
+  pullPolicy: IfNotPresent
+
+# ── Scaling ──────────────────────────────────────────────────────────────
+replicaCount: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+# ── Resources (cheapest viable defaults) ─────────────────────────────────
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+# ── Probes ───────────────────────────────────────────────────────────────
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 15
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+# ── ServiceAccount + Workload Identity ──────────────────────────────────
+serviceAccount:
+  create: true
+  annotations: {}              # GCP WI:  iam.gke.io/gcp-service-account: <sa-email>
+                               # AWS IRSA: eks.amazonaws.com/role-arn: <role-arn>
+
+# ── Ingress (off by default; bootstrap typically owns the shared LB) ────
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  tls: []
+
+# ── Schema-driven env injection ─────────────────────────────────────────
+# Populated by the parse-env-schema composite action from .env.example.
+# Manual overrides are allowed but not recommended — keep the contract in
+# .env.example and let CI fill these in.
+envLiterals: {}                # { KEY: "value", … } → ConfigMap data
+envParams: []                  # [ { key, source, path, store, [field] } ]
+envSecrets: []                 # [ { key, source, path, store, [field] } ]
+secretStoreRefs: []            # [ "cloud-default", "vault-default", … ]
+
+externalSecretRefreshInterval: 1h
+
+# ── Pod-level extras ─────────────────────────────────────────────────────
+podLabels: {}
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+imagePullSecrets: []
