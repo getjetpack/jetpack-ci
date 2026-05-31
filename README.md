@@ -149,6 +149,157 @@ No service repo changes required — they just start passing `cloud: oracle`.
 
 ---
 
+## 🔐 Secrets & config schema (`.env.example`)
+
+Every service repo declares its env vars in **one schema file** — `.env.example` — using source-prefixed references. The deploy job parses it, composes the cloud-specific paths, and feeds the result into helm as `--values`.
+
+### Schema syntax
+
+```bash
+# .env.example  (the contract — committed to git, no real values)
+DATABASE_URL=${secret:db/url}              # whole opaque secret
+JWT_SIGNING=${secret:auth/jwt#signing-key} # one field from a structured secret
+API_KEY=${vault:secret/data/stripe}        # HashiCorp Vault — path passed through
+LOG_LEVEL=${param:log-level}               # non-sensitive — Parameter Store / ConfigMap
+SERVICE_PORT=8080                          # literal default — goes into ConfigMap
+```
+
+The **source prefix is the backend** — extensible to anything ESO supports (1Password, Doppler, Infisical, …). Add a new prefix → add a row to the workflow's `*_store_default` inputs and ESO does the rest.
+
+### Path composition
+
+For `${secret:NAME}` and `${param:NAME}`, the workflow expands `NAME` into the project-wide convention:
+
+```
+{org}/{project}/{env}/{domain}/{service}/{name}
+       testa/gcp/dev/users/user-service/db-url
+```
+
+For `${vault:PATH}`, the path is passed through verbatim (Vault paths are arbitrary).
+
+### The generated `values-env.yaml`
+
+```yaml
+envLiterals:
+  SERVICE_PORT: "8080"
+
+envParams:
+  - { key: LOG_LEVEL, source: param, path: testa/gcp/dev/users/user-service/log-level, store: param-default }
+
+envSecrets:
+  - { key: DATABASE_URL, source: secret, path: testa/gcp/dev/users/user-service/db/url, store: cloud-default }
+  - { key: JWT_SIGNING,  source: secret, path: testa/gcp/dev/users/user-service/auth/jwt, field: signing-key, store: cloud-default }
+  - { key: API_KEY,      source: vault,  path: secret/data/stripe, store: vault-default }
+
+secretStoreRefs: [cloud-default, param-default, vault-default]
+```
+
+### What the helm chart in the service repo must support
+
+The chart's `values.yaml` declares these as empty defaults; templates iterate over them:
+
+```yaml
+# helm/values.yaml
+envLiterals: {}
+envParams: []
+envSecrets: []
+secretStoreRefs: []
+```
+
+Three templates:
+
+```yaml
+# helm/templates/configmap.yaml — literals + non-sensitive params
+{{- if or .Values.envLiterals .Values.envParams }}
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: {{ .Release.Name }}-config }
+data:
+  {{- range $k, $v := .Values.envLiterals }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+{{- end }}
+
+# helm/templates/externalsecret.yaml — one per unique store
+{{- range $store := .Values.secretStoreRefs }}
+  {{- $bucket := list }}
+  {{- range $.Values.envSecrets }}{{ if eq .store $store }}{{ $bucket = append $bucket . }}{{ end }}{{ end }}
+  {{- if $bucket }}
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata: { name: {{ $.Release.Name }}-{{ $store }} }
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { name: {{ $store }}, kind: ClusterSecretStore }
+  target: { name: {{ $.Release.Name }}-{{ $store }}-env, creationPolicy: Owner }
+  data:
+    {{- range $bucket }}
+    - secretKey: {{ .key }}
+      remoteRef:
+        key: {{ .path }}
+        {{- if .field }}property: {{ .field }}{{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
+# helm/templates/deployment.yaml — envFrom both
+spec:
+  template:
+    spec:
+      containers:
+      - name: {{ .Values.service.name }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        envFrom:
+        {{- if or .Values.envLiterals .Values.envParams }}
+        - configMapRef: { name: {{ .Release.Name }}-config }
+        {{- end }}
+        {{- range .Values.secretStoreRefs }}
+        - secretRef: { name: {{ $.Release.Name }}-{{ . }}-env }
+        {{- end }}
+```
+
+### What the bootstrap layer must provide
+
+In each cluster (per env), three `ClusterSecretStore` resources — installed once by the bootstrap addon and shared by every service:
+
+| Name | Backend |
+|---|---|
+| `cloud-default` | AWS Secrets Manager / GCP Secret Manager / Azure Key Vault (whichever cloud the project runs on) |
+| `param-default` | AWS Parameter Store / GCP Secret Manager (cheap tier) / Azure App Configuration |
+| `vault-default` | HashiCorp Vault (only if the project uses it) |
+
+The deploy SA is bound to those backends via Workload Identity (GCP) / IRSA (AWS) / Workload Identity (Azure) so ESO authenticates without static keys.
+
+### What the service's `infra/` Terraform creates
+
+For each `${secret:NAME}` / `${param:NAME}` reference in `.env.example`, the service-scaffold-generated `infra/secrets.tf` declares a secret-store entry with a placeholder value:
+
+```hcl
+resource "google_secret_manager_secret" "db_url" {
+  secret_id = "testa-gcp-dev-users-user-service-db-url"
+  replication { auto {} }
+}
+resource "google_secret_manager_secret_version" "db_url_initial" {
+  secret = google_secret_manager_secret.db_url.id
+  secret_data = "REPLACE_ME"
+  lifecycle { ignore_changes = [secret_data] }   # never overwrite once a real value is set
+}
+```
+
+Devs fill the real value via console / `gcloud secrets versions add` / `aws secretsmanager put-secret-value`.
+
+### Why this works for any backend
+
+| Need | Solution |
+|---|---|
+| Add HashiCorp Vault | Schema uses `${vault:…}`, bootstrap adds the `vault-default` `ClusterSecretStore`, ESO does the rest. No CI change. |
+| Add Doppler / Infisical / 1Password / AWS KMS / GCP Cloud KMS | Same recipe — new source prefix, new `ClusterSecretStore`, optional new `*_store_default` input. |
+| Mix backends in one service | Already works — each entry routes to its own store; helm template renders one `ExternalSecret` per store. |
+| Local dev | A small CLI (`jp env load`) reads the same `.env.example`, dispatches the right SDK based on the prefix, writes a real `.env` file for `docker-compose up`. |
+
+---
+
 ## Terraform infrastructure workflows
 
 ### `terraform-ci.yml`

@@ -79,6 +79,12 @@ on:
       # ── 🏗️ terraform (service infra) ────────────────────────────────────
       tf_dir:                         { description: "Per-service Terraform directory — apply only runs if files here changed", default: "./infra", type: string }
 
+      # ── 🔐 secrets schema (.env.example) ────────────────────────────────
+      env_schema_file:                { description: ".env.example file driving ConfigMap + ExternalSecret generation. Set to '' to disable.", default: ".env.example", type: string }
+      secret_store_default:           { description: "ClusterSecretStore name for ${secret:…} entries — usually the cloud's native Secret Manager", default: "cloud-default",  type: string }
+      param_store_default:            { description: "ClusterSecretStore name for ${param:…} entries — Parameter Store or equivalent",           default: "param-default",  type: string }
+      vault_store_default:            { description: "ClusterSecretStore name for ${vault:…} entries — HashiCorp Vault",                         default: "vault-default",  type: string }
+
 permissions:
   id-token: write
   contents: read
@@ -500,6 +506,87 @@ jobs:
           esac
           kubectl config current-context
 
+      - name: "📦 Install PyYAML for env parser"
+        if: inputs.env_schema_file != ''
+        run: pip install -q --user pyyaml || python3 -m pip install --user --break-system-packages pyyaml
+
+      - name: "🔐 Parse .env.example → values-env.yaml"
+        id: schema
+        if: inputs.env_schema_file != ''
+        env:
+          ORG:        ${{ inputs.organization }}
+          PROJECT:    ${{ inputs.project_name }}
+          DOMAIN:     ${{ inputs.domain }}
+          SERVICE:    ${{ inputs.service_name }}
+          ENVIRON:    ${{ inputs.env }}
+          SCHEMA:     ${{ inputs.env_schema_file }}
+          STORE_SEC:  ${{ inputs.secret_store_default }}
+          STORE_PRM:  ${{ inputs.param_store_default }}
+          STORE_VLT:  ${{ inputs.vault_store_default }}
+        run: |
+          if [ ! -f "$SCHEMA" ]; then
+            echo "::notice title=🔐 No env schema::file $SCHEMA absent — skipping env generation"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 - <<'PY'
+          # Parse the .env.example into a structured values file that the helm
+          # chart consumes. Each line of the form  KEY=${source:path[#field]}
+          # routes to one of:
+          #   • envLiterals (no $ prefix, plain value)
+          #   • envParams   (source = param  → ConfigMap-backed; non-sensitive)
+          #   • envSecrets  (source = secret → cloud Secret Manager via ESO)
+          #   • envSecrets  (source = vault  → HashiCorp Vault via ESO)
+          # The logical path is composed into the convention
+          #   {org}/{project}/{env}/{domain}/{service}/{name}
+          # for secret/param; vault paths are passed through untouched.
+          import os, re, yaml, sys, pathlib
+          schema  = pathlib.Path(os.environ["SCHEMA"]).read_text()
+          prefix  = f"{os.environ['ORG']}/{os.environ['PROJECT']}/{os.environ['ENVIRON']}/{os.environ['DOMAIN']}/{os.environ['SERVICE']}"
+          stores  = {
+              "secret": os.environ["STORE_SEC"],
+              "param":  os.environ["STORE_PRM"],
+              "ssm":    os.environ["STORE_PRM"],
+              "vault":  os.environ["STORE_VLT"],
+          }
+          ref_re  = re.compile(r"^\$\{(?P<src>[a-z0-9_-]+):(?P<path>[^}#]+)(?:#(?P<field>[^}]+))?\}$")
+          literals, params, secrets = {}, [], []
+          for line in schema.splitlines():
+              s = line.strip()
+              if not s or s.startswith("#") or "=" not in s:
+                  continue
+              key, val = s.split("=", 1)
+              key = key.strip()
+              val = val.strip()
+              m = ref_re.match(val)
+              if not m:
+                  literals[key] = val
+                  continue
+              src   = m.group("src")
+              raw   = m.group("path")
+              field = m.group("field")
+              # vault paths are arbitrary (e.g. secret/data/foo); pass through
+              path  = raw if src == "vault" else f"{prefix}/{raw}"
+              store = stores.get(src, os.environ["STORE_SEC"])
+              entry = {"key": key, "source": src, "path": path, "store": store}
+              if field: entry["field"] = field
+              (params if src == "param" else secrets).append(entry)
+
+          out = {
+              "envLiterals": literals,
+              "envParams":   params,
+              "envSecrets":  secrets,
+              "secretStoreRefs": sorted({e["store"] for e in (*params, *secrets)}),
+          }
+          pathlib.Path("/tmp/values-env.yaml").write_text(yaml.safe_dump(out, sort_keys=False))
+          print("---  values-env.yaml  ---")
+          print(yaml.safe_dump(out, sort_keys=False))
+          PY
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+          # Summarize counts so the GH UI annotation is readable
+          LITERALS=$(grep -c '^  ' /tmp/values-env.yaml | head -1 || echo 0)
+          echo "::notice title=🔐 Schema parsed::see Deploy job summary for the breakdown"
+
       - name: "⚓ Setup Helm"
         uses: azure/setup-helm@v4
         with:
@@ -510,6 +597,10 @@ jobs:
         env:
           NS: ${{ needs.init.outputs.namespace }}
         run: |
+          EXTRA_VALUES=""
+          if [ -f /tmp/values-env.yaml ]; then
+            EXTRA_VALUES="--values /tmp/values-env.yaml"
+          fi
           helm upgrade --install "${{ inputs.service_name }}" "${{ inputs.chart_path }}" \
             --namespace "$NS" \
             --create-namespace \
@@ -517,6 +608,7 @@ jobs:
             --set image.tag="${{ needs.init.outputs.image_tag }}" \
             --set environment="${{ inputs.env }}" \
             --set service.name="${{ inputs.service_name }}" \
+            $EXTRA_VALUES \
             --wait \
             --atomic \
             --timeout "${{ inputs.helm_timeout }}"
