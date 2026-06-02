@@ -82,6 +82,9 @@ inputs:
   vault_store:
     description: "ClusterSecretStore name for ${vault:…} entries"
     default: "vault-default"
+  internal_domain:
+    description: "Private DNS domain. When set, the helm chart emits an internal LoadBalancer + external-dns annotation so the service is reachable via VPN at {service}.{namespace}.{internal_domain}."
+    default: ""
   extra_store_map:
     description: |
       JSON object mapping additional source prefixes to ClusterSecretStore
@@ -142,7 +145,11 @@ runs:
         EXTRA_STORES:  ${{ inputs.extra_store_map }}
         IMAGE_REPO:    ${{ inputs.image_repository }}
         IMAGE_TAG:     ${{ inputs.image_tag }}
-        SERVICE_PORT:  ${{ inputs.service_port }}
+        SERVICE_PORT:    ${{ inputs.service_port }}
+        INTERNAL_DOMAIN: ${{ inputs.internal_domain }}
+        # NAMESPACE defaults to DOMAIN. The chart uses it to compose the
+        # external-dns hostname: {service}.{namespace}.{internal_domain}
+        DOMAIN:          ${{ inputs.domain }}
         REPLICAS:      ${{ inputs.replicas }}
         CLOUD:         ${{ inputs.cloud }}
       run: |
@@ -310,8 +317,20 @@ runs:
         store_set = sorted({e["store"] for e in (*params, *secrets)})
 
         # ── Identity (always emitted; chart needs at minimum service.name + image)
+        service_obj = {
+            "name": os.environ["SERVICE"],
+            "port": int(os.environ.get("SERVICE_PORT") or 8080),
+        }
+        # When set, the chart switches to internal LoadBalancer + emits an
+        # external-dns annotation so the service is reachable via VPN at
+        # {service}.{namespace}.{internal_domain}. Defaults to empty →
+        # ClusterIP fallback (in-cluster traffic only).
+        if os.environ.get("INTERNAL_DOMAIN"):
+            service_obj["internalDomain"] = os.environ["INTERNAL_DOMAIN"]
+            service_obj["namespace"]       = os.environ.get("NAMESPACE", os.environ.get("DOMAIN", "default"))
+
         out = {
-            "service":     {"name": os.environ["SERVICE"], "port": int(os.environ.get("SERVICE_PORT") or 8080)},
+            "service":     service_obj,
             "environment": os.environ["ENVIRON"],
             "replicaCount": int(os.environ.get("REPLICAS") or 1),
         }

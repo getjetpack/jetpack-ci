@@ -4,8 +4,22 @@ metadata:
   name: {{ .Values.service.name }}
   labels:
     {{- include "app.labels" . | nindent 4 }}
+  {{- /*
+    When `service.internalDomain` is set (jetset network.internalDomain),
+    expose via a regional internal LoadBalancer so VPN clients can reach
+    the service through Cloud DNS. external-dns picks up the hostname
+    annotation and writes the matching A record into the private zone.
+    When not set, falls back to ClusterIP — only in-cluster traffic.
+  */}}
+  {{- if .Values.service.internalDomain }}
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
+    networking.gke.io/internal-load-balancer-allow-global-access: "true"
+    external-dns.alpha.kubernetes.io/hostname: "{{ .Values.service.name }}.{{ .Values.service.namespace | default "default" }}.{{ .Values.service.internalDomain }}"
+    external-dns.alpha.kubernetes.io/ttl: "60"
+  {{- end }}
 spec:
-  type: ClusterIP
+  type: {{ if .Values.service.internalDomain }}LoadBalancer{{ else }}ClusterIP{{ end }}
   ports:
     - port: {{ .Values.service.port }}
       targetPort: http
