@@ -322,15 +322,17 @@ jobs:
         id: tf
         working-directory: ${{ inputs.tf_dir }}
         env:
-          TF_VAR_service_name: ${{ inputs.service_name }}
-          TF_VAR_env:          ${{ inputs.env }}
-          TF_VAR_region:       ${{ inputs.region }}
-          TF_VAR_image_tag:    ${{ needs.init.outputs.image_tag }}
+          TF_VAR_image_tag: ${{ needs.init.outputs.image_tag }}
         run: |
+          VARFILE="env/${{ inputs.env }}/${{ inputs.region }}.tfvars"
+          if [ ! -f "$VARFILE" ]; then
+            echo "::error title=🏗️ Terraform::Missing $VARFILE — regenerate the service to emit it."
+            exit 1
+          fi
           echo "::notice title=🏗️ Terraform::initialising"
           terraform init
-          echo "::notice title=🏗️ Terraform::applying"
-          terraform apply -auto-approve
+          echo "::notice title=🏗️ Terraform::applying with $VARFILE"
+          terraform apply -auto-approve -var-file="$VARFILE"
           # Capture outputs as a base64 blob — downstream deploy job can pull
           # values from it via `jq` without us inventing per-output args.
           OUTPUTS_B64=$(terraform output -json | base64 -w0)
@@ -384,6 +386,11 @@ jobs:
       - name: "☁️ Setup gcloud"
         if: inputs.cloud == 'gcp'
         uses: google-github-actions/setup-gcloud@v2
+        with:
+          # GKE auth via kubectl / helm needs the auth-plugin since k8s
+          # 1.26+ removed the in-tree gcp auth provider. Installs the
+          # binary the kubeconfig produced by `get-credentials` invokes.
+          install_components: gke-gcloud-auth-plugin
 
       - name: "🔐 Authenticate to Azure (OIDC)"
         if: inputs.cloud == 'azure'
@@ -474,6 +481,11 @@ jobs:
       - name: "☁️ Setup gcloud"
         if: inputs.cloud == 'gcp'
         uses: google-github-actions/setup-gcloud@v2
+        with:
+          # GKE auth via kubectl / helm needs the auth-plugin since k8s
+          # 1.26+ removed the in-tree gcp auth provider. Installs the
+          # binary the kubeconfig produced by `get-credentials` invokes.
+          install_components: gke-gcloud-auth-plugin
 
       - name: "🔐 Authenticate to Azure (OIDC)"
         if: inputs.cloud == 'azure'
