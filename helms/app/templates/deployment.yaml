@@ -43,10 +43,21 @@ spec:
             {{- if .Values.envLiterals }}
             - configMapRef:
                 name: {{ .Values.service.name }}-config
+                # optional: true → pod starts even if the ConfigMap hasn't
+                # landed yet. Prevents CreateContainerConfigError from
+                # blocking helm's --wait/--atomic before we get any signal.
+                optional: true
             {{- end }}
             {{- range .Values.secretStoreRefs }}
             - secretRef:
                 name: {{ $.Values.service.name }}-{{ . }}-env
+                # ExternalSecrets are async — ESO fetches from cloud Secret
+                # Manager and materialises the k8s Secret a few seconds AFTER
+                # helm applies. Marking optional lets the pod start and the
+                # container will crash-loop briefly until the Secret shows
+                # up (visible in `kubectl describe pod` as env-var missing).
+                # Once the Secret exists the next restart picks it up.
+                optional: true
             {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
