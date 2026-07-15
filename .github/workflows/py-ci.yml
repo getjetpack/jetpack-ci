@@ -392,12 +392,16 @@ jobs:
   # ─── 📦 RELEASE (push image) ────────────────────────────────────────────
   release:
     name: "📦 Release"
-    needs: [init, build, test]
-    # Allow test to be skipped (when run_tests=false) but never failed.
+    needs: [init, build, test, infra]
+    # Allow test + infra to be skipped (when run_tests=false / no TF changes)
+    # but never failed. A failing infra job stops the pipeline here — no
+    # image gets pushed, no deploy tries to fetch missing secrets, no helm
+    # timeout masks the real error.
     if: |
       always()
       && needs.build.result == 'success'
       && (needs.test.result == 'success' || needs.test.result == 'skipped')
+      && (needs.infra.result == 'success' || needs.infra.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       image_full:      ${{ needs.init.outputs.image_full }}
