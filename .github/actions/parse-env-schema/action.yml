@@ -147,9 +147,10 @@ runs:
         IMAGE_TAG:     ${{ inputs.image_tag }}
         SERVICE_PORT:    ${{ inputs.service_port }}
         INTERNAL_DOMAIN: ${{ inputs.internal_domain }}
-        # NAMESPACE defaults to DOMAIN. The chart uses it to compose the
-        # external-dns hostname: {service}.{namespace}.{internal_domain}
-        DOMAIN:          ${{ inputs.domain }}
+        # NAMESPACE is unset here — the Python step reads it from the env and
+        # falls back to DOMAIN when absent (see the `namespace` assignment
+        # further down). The chart uses namespace to compose the external-dns
+        # hostname: {service}.{namespace}.{internal_domain}.
         REPLICAS:      ${{ inputs.replicas }}
         CLOUD:         ${{ inputs.cloud }}
       run: |
