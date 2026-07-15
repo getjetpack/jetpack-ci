@@ -153,10 +153,14 @@ jobs:
       - name: "🔎 Detect Terraform changes under ${{ inputs.tf_dir }}"
         id: tf_changes
         run: |
+          # Normalize `tf_dir` — strip leading "./" and trailing "/" so both
+          # `./infra` and `.scripts/tf` and `infra/` all collapse to the same
+          # form that matches git diff output.
+          TF_DIR_NORM="$(echo "${{ inputs.tf_dir }}" | sed -e 's|^\./||' -e 's|/$||')"
           # If the dir doesn't exist, infra job is skipped outright.
-          if [ ! -d "${{ inputs.tf_dir }}" ]; then
+          if [ ! -d "$TF_DIR_NORM" ] && [ ! -d "./$TF_DIR_NORM" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=🔎 TF dir missing::no service infra to apply"
+            echo "::notice title=🔎 TF dir missing::no service infra to apply (looked in $TF_DIR_NORM)"
             exit 0
           fi
           # First commit (no HEAD~1) → treat as changed so initial apply runs.
@@ -165,7 +169,7 @@ jobs:
             echo "::notice title=🔎 First commit::running infra apply"
             exit 0
           fi
-          if git diff --name-only HEAD~1 HEAD | grep -qE "^${{ inputs.tf_dir }}/"; then
+          if git diff --name-only HEAD~1 HEAD | grep -qE "^${TF_DIR_NORM}/"; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "::notice title=✅ TF changes detected::infra job will run"
           else
