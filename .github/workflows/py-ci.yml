@@ -340,8 +340,34 @@ jobs:
             echo "::error title=🏗️ Terraform::Missing $VARFILE — regenerate the service to emit it."
             exit 1
           fi
+
+          # ── Backend config per cloud ────────────────────────────────
+          # State bucket convention (owned by bootstrap):
+          #   GCP:   {gcp_project_id}-tfstate
+          #   AWS:   {aws_account_id}-tfstate         (via caller identity)
+          #   Azure: TODO — Azure state backend not wired yet
+          # Prefix scopes per (env, region, service) so services in the same
+          # env can't stomp each other.
+          BACKEND_ARGS=""
+          case "${{ inputs.cloud }}" in
+            gcp)
+              BUCKET="${CLOUDSDK_CORE_PROJECT:-$(gcloud config get-value project 2>/dev/null)}-tfstate"
+              PREFIX="services/${{ inputs.service_name }}/${{ inputs.env }}/${{ inputs.region }}"
+              BACKEND_ARGS="-backend-config=bucket=$BUCKET -backend-config=prefix=$PREFIX"
+              echo "::notice title=🏗️ Backend::gcs bucket=$BUCKET prefix=$PREFIX"
+              ;;
+            aws)
+              # AWS caller-identity → account id → tfstate bucket
+              ACCT=$(aws sts get-caller-identity --query Account --output text)
+              BUCKET="${ACCT}-tfstate"
+              KEY="services/${{ inputs.service_name }}/${{ inputs.env }}/${{ inputs.region }}/terraform.tfstate"
+              BACKEND_ARGS="-backend-config=bucket=$BUCKET -backend-config=key=$KEY -backend-config=region=${{ inputs.region }}"
+              echo "::notice title=🏗️ Backend::s3 bucket=$BUCKET key=$KEY"
+              ;;
+          esac
+
           echo "::notice title=🏗️ Terraform::initialising"
-          terraform init
+          terraform init $BACKEND_ARGS
           echo "::notice title=🏗️ Terraform::applying with $VARFILE"
           terraform apply -auto-approve -var-file="$VARFILE"
           # Capture outputs as a base64 blob — downstream deploy job can pull
