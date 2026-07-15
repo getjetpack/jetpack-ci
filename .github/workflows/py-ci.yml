@@ -163,6 +163,12 @@ jobs:
             echo "::notice title=🔎 TF dir missing::no service infra to apply (looked in $TF_DIR_NORM)"
             exit 0
           fi
+          # Manual dispatch → always run infra (operator explicitly triggered).
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=🔎 workflow_dispatch::running infra apply unconditionally"
+            exit 0
+          fi
           # First commit (no HEAD~1) → treat as changed so initial apply runs.
           if ! git rev-parse HEAD~1 >/dev/null 2>&1; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
