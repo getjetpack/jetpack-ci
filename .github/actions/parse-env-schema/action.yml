@@ -182,6 +182,20 @@ runs:
             param_sources = {"param", "ssm"}
             ref_re = re.compile(r"^\$\{(?P<src>[a-z0-9_-]+):(?P<path>[^}#]+)(?:#(?P<field>[^}]+))?\}$")
 
+            # Provider-specific naming rules for the secret backend. Slashes
+            # are fine on AWS (they're the natural hierarchy in SSM Parameter
+            # Store and Secrets Manager) but rejected on GCP Secret Manager
+            # (names must match [a-zA-Z_-][a-zA-Z0-9_-]*) and Azure Key Vault
+            # (names must match [a-zA-Z0-9-]). Vault always passes through.
+            _cloud = (os.environ.get("CLOUD") or "").lower()
+            def compose_path(src, raw):
+                if src == "vault":
+                    return raw
+                full = f"{prefix}/{raw}"
+                if _cloud in ("gcp", "azure"):
+                    return full.replace("/", "-")
+                return full
+
             # ── K8S_OVERRIDE_* support ─────────────────────────────────
             # KEY in .env.example that starts with K8S_OVERRIDE_ doesn't go
             # into the running pod's env. Instead its value is resolved at
@@ -302,8 +316,9 @@ runs:
                 src   = m.group("src")
                 raw   = m.group("path")
                 field = m.group("field")
-                # Vault paths are passed through; everything else gets the project prefix
-                path  = raw if src == "vault" else f"{prefix}/{raw}"
+                # Vault passes through; AWS keeps slashes; GCP + Azure strip them
+                # (secret-manager backends there reject slashes in names).
+                path  = compose_path(src, raw)
                 store = stores.get(src, os.environ["STORE_SEC"])
                 entry = {"key": key, "source": src, "path": path, "store": store}
                 if field:
