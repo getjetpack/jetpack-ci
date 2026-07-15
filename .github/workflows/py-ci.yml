@@ -75,6 +75,14 @@ on:
       internal_domain:                { description: "Private DNS domain (e.g. gcp.internal). When set, helm chart emits internal LoadBalancer + external-dns hostname so the service is reachable via VPN.", default: "", type: string }
       helm_timeout:                   { description: "Helm rollout timeout (e.g. 5m, 10m)",                               default: "5m", type: string }
 
+      # ── 🌐 ambient env literals ─────────────────────────────────────────
+      # Non-sensitive globals injected into every service's ConfigMap without
+      # having to declare them in the service's .env.example. Same value for
+      # every service in a given env — pass here once per env from the caller.
+      log_level:                      { description: "LOG_LEVEL injected as an ambient env literal for every service in this env.",            default: "info", type: string }
+      otlp_endpoint:                  { description: "OTLP_ENDPOINT injected as an ambient env literal (e.g. http://otel-collector.observability.svc.cluster.local:4317).", default: "", type: string }
+      extra_ambient:                  { description: "JSON object of additional ambient literals (e.g. {\"REGION\":\"us-west2\"}). Service-declared keys always win.",     default: "{}",   type: string }
+
       # ── 🐍 python ────────────────────────────────────────────────────────
       python_version:                 { description: "Python version for setup-python",                                   default: "3.12", type: string }
       run_tests:                      { description: "Run pytest in the test job",                                        default: true,   type: boolean }
@@ -538,6 +546,9 @@ jobs:
           param_store:      ${{ inputs.param_store_default }}
           vault_store:      ${{ inputs.vault_store_default }}
           internal_domain:  ${{ inputs.internal_domain }}
+          log_level:        ${{ inputs.log_level }}
+          otlp_endpoint:    ${{ inputs.otlp_endpoint }}
+          extra_ambient:    ${{ inputs.extra_ambient }}
 
       - name: "📚 Checkout helm charts library"
         if: inputs.helm_chart_override == ''

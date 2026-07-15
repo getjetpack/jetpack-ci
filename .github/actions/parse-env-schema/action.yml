@@ -93,6 +93,24 @@ inputs:
       (or in the well-known set above).
     default: "{}"
 
+  # ── Ambient env-scoped literals ────────────────────────────────────────
+  # Non-sensitive globals injected into every service's ConfigMap without
+  # the service having to declare them in its own .env.example. Provided by
+  # the deploy workflow YAML (generated per env by Jetpack). ENVIRONMENT is
+  # auto-derived from `env`; the rest are opt-in via these inputs.
+  log_level:
+    description: "LOG_LEVEL injected as an ambient env literal for every service in this env."
+    default: ""
+  otlp_endpoint:
+    description: "OTLP_ENDPOINT injected as an ambient env literal for every service in this env."
+    default: ""
+  extra_ambient:
+    description: |
+      JSON object of additional ambient env literals to inject (e.g. {"REGION":"us-west2"}).
+      Keys already declared in .env.example win — ambient values are only
+      injected when the service hasn't overridden the key.
+    default: "{}"
+
 outputs:
   values_file:
     description: "Path to the generated values YAML (only meaningful when skipped=false)"
@@ -147,6 +165,9 @@ runs:
         IMAGE_TAG:     ${{ inputs.image_tag }}
         SERVICE_PORT:    ${{ inputs.service_port }}
         INTERNAL_DOMAIN: ${{ inputs.internal_domain }}
+        AMBIENT_LOG_LEVEL:     ${{ inputs.log_level }}
+        AMBIENT_OTLP_ENDPOINT: ${{ inputs.otlp_endpoint }}
+        AMBIENT_EXTRA:         ${{ inputs.extra_ambient }}
         # NAMESPACE is unset here — the Python step reads it from the env and
         # falls back to DOMAIN when absent (see the `namespace` assignment
         # further down). The chart uses namespace to compose the external-dns
@@ -330,6 +351,26 @@ runs:
             overrides = {}
             override_namespace = None
 
+        # ── Ambient env-scoped literals (injected only when the service
+        #    hasn't declared the same key in its own .env.example). Sources:
+        #      • ENVIRONMENT — always, from the ENVIRON env var
+        #      • LOG_LEVEL, OTLP_ENDPOINT — from action inputs
+        #      • extra_ambient JSON — pipeline-provided extras (REGION, etc.)
+        ambient = {"ENVIRONMENT": os.environ["ENVIRON"]}
+        if os.environ.get("AMBIENT_LOG_LEVEL"):
+            ambient["LOG_LEVEL"] = os.environ["AMBIENT_LOG_LEVEL"]
+        if os.environ.get("AMBIENT_OTLP_ENDPOINT"):
+            ambient["OTLP_ENDPOINT"] = os.environ["AMBIENT_OTLP_ENDPOINT"]
+        try:
+            ambient_extra = json.loads(os.environ.get("AMBIENT_EXTRA") or "{}")
+            if isinstance(ambient_extra, dict):
+                for k, v in ambient_extra.items():
+                    ambient[str(k)] = str(v)
+        except json.JSONDecodeError as e:
+            print(f"::warning title=Bad extra_ambient::{e}")
+        for k, v in ambient.items():
+            literals.setdefault(k, v)
+
         store_set = sorted({e["store"] for e in (*params, *secrets)})
 
         # ── Identity (always emitted; chart needs at minimum service.name + image)
@@ -366,9 +407,13 @@ runs:
         if overrides:
             deep_merge(out, overrides)
 
-        # ── Schema-derived blocks (only when we parsed something)
+        # ── envLiterals is emitted whenever we have any literals — either
+        # from a parsed .env.example OR from ambient injection above. Schema-
+        # only blocks (envParams / envSecrets / secretStoreRefs) still gate
+        # on schema_seen since they only make sense with a real schema.
+        if literals:
+            out["envLiterals"] = literals
         if schema_seen:
-            out["envLiterals"]     = literals
             out["envParams"]       = params
             out["envSecrets"]      = secrets
             out["secretStoreRefs"] = store_set
