@@ -360,7 +360,9 @@ runs:
         if os.environ.get("AMBIENT_LOG_LEVEL"):
             ambient["LOG_LEVEL"] = os.environ["AMBIENT_LOG_LEVEL"]
         if os.environ.get("AMBIENT_OTLP_ENDPOINT"):
-            ambient["OTLP_ENDPOINT"] = os.environ["AMBIENT_OTLP_ENDPOINT"]
+            # OTel SDKs read OTEL_EXPORTER_OTLP_ENDPOINT — inject with the
+            # canonical name so services don't need per-language mapping.
+            ambient["OTEL_EXPORTER_OTLP_ENDPOINT"] = os.environ["AMBIENT_OTLP_ENDPOINT"]
         try:
             ambient_extra = json.loads(os.environ.get("AMBIENT_EXTRA") or "{}")
             if isinstance(ambient_extra, dict):
