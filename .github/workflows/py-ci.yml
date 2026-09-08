@@ -334,6 +334,12 @@ jobs:
         working-directory: ${{ inputs.tf_dir }}
         env:
           TF_VAR_image_tag: ${{ needs.init.outputs.image_tag }}
+          # Azure: OIDC auth for the azurerm provider AND backend. Ignored on
+          # AWS/GCP (no azurerm), so safe to set unconditionally.
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ inputs.azure_client_id }}
+          ARM_TENANT_ID: ${{ inputs.azure_tenant_id }}
+          ARM_SUBSCRIPTION_ID: ${{ inputs.azure_subscription_id }}
         run: |
           VARFILE="env/${{ inputs.env }}/${{ inputs.region }}.tfvars"
           if [ ! -f "$VARFILE" ]; then
@@ -345,8 +351,8 @@ jobs:
           # State bucket convention (owned by bootstrap):
           #   GCP:   {gcp_project_id}-tfstate
           #   AWS:   {aws_account_id}-tfstate         (via caller identity)
-          #   Azure: TODO — Azure state backend not wired yet
-          # Prefix scopes per (env, region, service) so services in the same
+          #   Azure: RG {project}-tfstate-rg, SA {project}{env}tfst, container tfstate
+          # Prefix/key scopes per (env, region, service) so services in the same
           # env can't stomp each other.
           BACKEND_ARGS=""
           case "${{ inputs.cloud }}" in
@@ -363,6 +369,16 @@ jobs:
               KEY="services/${{ inputs.service_name }}/${{ inputs.env }}/${{ inputs.region }}/terraform.tfstate"
               BACKEND_ARGS="-backend-config=bucket=$BUCKET -backend-config=key=$KEY -backend-config=region=${{ inputs.region }}"
               echo "::notice title=🏗️ Backend::s3 bucket=$BUCKET key=$KEY"
+              ;;
+            azure)
+              # Reuse the bootstrap-owned state account (created by the bootstrap
+              # workflow's "Ensure tfstate storage exists" step) — same RG / SA /
+              # container naming, with a service-scoped key.
+              RG="${{ inputs.project_name }}-tfstate-rg"
+              SA=$(echo "${{ inputs.project_name }}${{ inputs.env }}tfst" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)
+              KEY="services/${{ inputs.service_name }}/${{ inputs.env }}/${{ inputs.region }}.tfstate"
+              BACKEND_ARGS="-backend-config=resource_group_name=$RG -backend-config=storage_account_name=$SA -backend-config=container_name=tfstate -backend-config=key=$KEY"
+              echo "::notice title=🏗️ Backend::azurerm sa=$SA container=tfstate key=$KEY"
               ;;
           esac
 
