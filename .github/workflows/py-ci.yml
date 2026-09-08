@@ -577,9 +577,11 @@ jobs:
               ;;
             azure)
               echo "::notice title=🧭 AKS::updating kubeconfig"
+              # AKS lives in the bootstrap resource group {project}-{env}-rg
+              # (not cluster_location, which is a region/zone concept).
               az aks get-credentials \
                 --name "${{ inputs.cluster_name }}" \
-                --resource-group "${{ inputs.cluster_location }}" \
+                --resource-group "${{ inputs.project_name }}-${{ inputs.env }}-rg" \
                 --overwrite-existing
               ;;
           esac
