@@ -392,6 +392,14 @@ jobs:
           echo "outputs_b64=$OUTPUTS_B64" >> "$GITHUB_OUTPUT"
 
       - name: "📋 Infra summary"
+        env:
+          # `terraform output` re-reads the backend; give it the same Azure OIDC
+          # creds as init+apply so azurerm doesn't fall back to az-CLI auth
+          # (unsupported for a service principal). Ignored on AWS/GCP.
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ inputs.azure_client_id }}
+          ARM_TENANT_ID: ${{ inputs.azure_tenant_id }}
+          ARM_SUBSCRIPTION_ID: ${{ inputs.azure_subscription_id }}
         run: |
           {
             echo "### 🏗️ Infra"
