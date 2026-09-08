@@ -5,6 +5,7 @@ service:
   protocol: TCP
 
 environment: dev               # set by the pipeline via --set environment
+cloud: ""                      # aws | gcp | azure — set by the pipeline; picks the internal-LB annotation
 
 # ── Image ────────────────────────────────────────────────────────────────
 image:

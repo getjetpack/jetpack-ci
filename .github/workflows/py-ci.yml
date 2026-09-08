@@ -658,6 +658,7 @@ jobs:
             --namespace "$NS" \
             --create-namespace \
             $VALUES_ARGS \
+            --set cloud="${{ inputs.cloud }}" \
             --wait \
             --atomic \
             --timeout "${{ inputs.helm_timeout }}"
