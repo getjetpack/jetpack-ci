@@ -5,28 +5,20 @@ metadata:
   labels:
     {{- include "app.labels" . | nindent 4 }}
   {{- /*
-    When `service.internalDomain` is set (jetset network.internalDomain),
-    expose via a regional internal LoadBalancer so VPN clients can reach
-    the service through Cloud DNS. external-dns picks up the hostname
-    annotation and writes the matching A record into the private zone.
-    When not set, falls back to ClusterIP — only in-cluster traffic.
+    Always ClusterIP.
+
+    Exposure is the platform's job, not a per-service one: bootstrap installs
+    an ingress controller and a DNS controller, and `ingress.yaml` below asks
+    them for a hostname. A `type: LoadBalancer` Service here used to give every
+    service its own cloud load balancer — one bill and one set of listeners per
+    service, with the service owning infrastructure it should never have known
+    about.
+
+    `ingress.enabled` is false only when a project has no internal domain, in
+    which case nothing can be published and in-cluster traffic is all there is.
   */}}
-  {{- if .Values.service.internalDomain }}
-  annotations:
-    {{- if eq .Values.cloud "gcp" }}
-    networking.gke.io/load-balancer-type: "Internal"
-    networking.gke.io/internal-load-balancer-allow-global-access: "true"
-    {{- else if eq .Values.cloud "azure" }}
-    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
-    {{- else if eq .Values.cloud "aws" }}
-    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
-    service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
-    {{- end }}
-    external-dns.alpha.kubernetes.io/hostname: "{{ .Values.service.name }}.{{ .Values.service.namespace | default "default" }}.{{ .Values.service.internalDomain }}"
-    external-dns.alpha.kubernetes.io/ttl: "60"
-  {{- end }}
 spec:
-  type: {{ if .Values.service.internalDomain }}LoadBalancer{{ else }}ClusterIP{{ end }}
+  type: ClusterIP
   ports:
     - port: {{ .Values.service.port }}
       targetPort: http
