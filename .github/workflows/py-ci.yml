@@ -81,6 +81,9 @@ on:
 
       # ── 🏗️ terraform (service infra) ────────────────────────────────────
       tf_dir:                         { description: "Per-service Terraform directory — apply only runs if files here changed", default: "./infra", type: string }
+      tf_state_bucket:                { description: "AWS/GCP state bucket owned by bootstrap. Jetpack names it {resource_prefix}-{env}-tfstate, which can't be derived from the account/project id — pass it explicitly. Empty falls back to the legacy {account_id}-tfstate / {gcp_project}-tfstate guess.", default: "", type: string }
+      tf_state_storage_account:       { description: "Azure only — state storage account owned by bootstrap. Empty falls back to {project_name}{env}tfst.", default: "", type: string }
+      tf_state_resource_group:        { description: "Azure only — resource group holding the state account. Empty falls back to {project_name}-tfstate-rg.", default: "", type: string }
 
       # ── 🔐 secrets schema (.env.example) ────────────────────────────────
       env_schema_file:                { description: ".env.example file driving ConfigMap + ExternalSecret generation. Set to '' to disable.", default: ".env.example", type: string }
@@ -357,15 +360,21 @@ jobs:
           BACKEND_ARGS=""
           case "${{ inputs.cloud }}" in
             gcp)
-              BUCKET="${CLOUDSDK_CORE_PROJECT:-$(gcloud config get-value project 2>/dev/null)}-tfstate"
+              BUCKET="${{ inputs.tf_state_bucket }}"
+              [ -n "$BUCKET" ] || BUCKET="${CLOUDSDK_CORE_PROJECT:-$(gcloud config get-value project 2>/dev/null)}-tfstate"
               PREFIX="services/${{ inputs.service_name }}/${{ inputs.env }}/${{ inputs.region }}"
               BACKEND_ARGS="-backend-config=bucket=$BUCKET -backend-config=prefix=$PREFIX"
               echo "::notice title=🏗️ Backend::gcs bucket=$BUCKET prefix=$PREFIX"
               ;;
             aws)
-              # AWS caller-identity → account id → tfstate bucket
-              ACCT=$(aws sts get-caller-identity --query Account --output text)
-              BUCKET="${ACCT}-tfstate"
+              # Bootstrap owns the bucket and names it {resource_prefix}-{env}-tfstate,
+              # which is NOT derivable from the account id — the caller passes it.
+              # Fall back to the legacy account-id guess only when it's absent.
+              BUCKET="${{ inputs.tf_state_bucket }}"
+              if [ -z "$BUCKET" ]; then
+                ACCT=$(aws sts get-caller-identity --query Account --output text)
+                BUCKET="${ACCT}-tfstate"
+              fi
               KEY="services/${{ inputs.service_name }}/${{ inputs.env }}/${{ inputs.region }}/terraform.tfstate"
               BACKEND_ARGS="-backend-config=bucket=$BUCKET -backend-config=key=$KEY -backend-config=region=${{ inputs.region }}"
               echo "::notice title=🏗️ Backend::s3 bucket=$BUCKET key=$KEY"
@@ -374,8 +383,10 @@ jobs:
               # Reuse the bootstrap-owned state account (created by the bootstrap
               # workflow's "Ensure tfstate storage exists" step) — same RG / SA /
               # container naming, with a service-scoped key.
-              RG="${{ inputs.project_name }}-tfstate-rg"
-              SA=$(echo "${{ inputs.project_name }}${{ inputs.env }}tfst" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)
+              RG="${{ inputs.tf_state_resource_group }}"
+              [ -n "$RG" ] || RG="${{ inputs.project_name }}-tfstate-rg"
+              SA="${{ inputs.tf_state_storage_account }}"
+              [ -n "$SA" ] || SA=$(echo "${{ inputs.project_name }}${{ inputs.env }}tfst" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)
               KEY="services/${{ inputs.service_name }}/${{ inputs.env }}/${{ inputs.region }}.tfstate"
               BACKEND_ARGS="-backend-config=resource_group_name=$RG -backend-config=storage_account_name=$SA -backend-config=container_name=tfstate -backend-config=key=$KEY"
               echo "::notice title=🏗️ Backend::azurerm sa=$SA container=tfstate key=$KEY"
