@@ -216,11 +216,24 @@ jobs:
       - name: "🛎️ Checkout"
         uses: actions/checkout@v4
 
+      - name: "🔎 Lockfile?"
+        id: lock
+        run: |
+          # setup-node's npm cache REQUIRES a lockfile and fails the job without
+          # one — a freshly scaffolded service has none until someone commits it.
+          # An empty `cache` input disables caching instead of erroring.
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ] || [ -f yarn.lock ]; then
+            echo "cache=npm" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=🔎 No lockfile::dependency caching off; commit package-lock.json to speed builds up"
+            echo "cache=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: "🟢 Setup Node ${{ needs.init.outputs.node_version }}"
         uses: actions/setup-node@v4
         with:
           node-version: ${{ needs.init.outputs.node_version }}
-          cache: "npm"
+          cache: ${{ steps.lock.outputs.cache }}
 
       - name: "📥 Install dependencies"
         run: |
@@ -268,11 +281,24 @@ jobs:
       - name: "🛎️ Checkout"
         uses: actions/checkout@v4
 
+      - name: "🔎 Lockfile?"
+        id: lock
+        run: |
+          # setup-node's npm cache REQUIRES a lockfile and fails the job without
+          # one — a freshly scaffolded service has none until someone commits it.
+          # An empty `cache` input disables caching instead of erroring.
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ] || [ -f yarn.lock ]; then
+            echo "cache=npm" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=🔎 No lockfile::dependency caching off; commit package-lock.json to speed builds up"
+            echo "cache=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: "🟢 Setup Node"
         uses: actions/setup-node@v4
         with:
           node-version: ${{ needs.init.outputs.node_version }}
-          cache: "npm"
+          cache: ${{ steps.lock.outputs.cache }}
 
       - name: "📥 Install dependencies"
         run: |
