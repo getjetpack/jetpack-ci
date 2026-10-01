@@ -293,7 +293,12 @@ jobs:
           VPN_BUCKET=$(terraform output -raw vpn_profile_s3_bucket 2>/dev/null || echo "")
 
           embed_profile() {
-            local key="$1" output_name="$2" tmp="/tmp/$output_name"
+            # Separate lines on purpose: a single `local a=$1 b=/tmp/$a` expands
+            # every word BEFORE assigning any of them, so b would be built from
+            # an unset a — which silently made the target `/tmp/` (a directory).
+            local key="$1"
+            local output_name="$2"
+            local tmp="/tmp/$output_name"
             [ -z "$VPN_BUCKET" ] && return 0
             [ -z "$key" ] && return 0
             echo "Looking for s3://$VPN_BUCKET/$key"
