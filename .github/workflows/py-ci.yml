@@ -680,13 +680,23 @@ jobs:
           if [ -n "$EXTRA_VALUES" ] && [ -f "$EXTRA_VALUES" ]; then
             VALUES_ARGS="$VALUES_ARGS --values $EXTRA_VALUES"
           fi
+          # --atomic only makes sense when there IS a previous revision to roll
+          # back to. On a first install it uninstalls everything instead,
+          # deleting the crash-looping pods that explain the failure before
+          # anyone can read their logs.
+          ATOMIC=""
+          if helm status "${{ inputs.service_name }}" -n "$NS" >/dev/null 2>&1; then
+            ATOMIC="--atomic"
+          else
+            echo "::notice title=🚀 First install::skipping --atomic so a failed rollout stays inspectable"
+          fi
           helm upgrade --install "${{ inputs.service_name }}" "$CHART_PATH" \
             --namespace "$NS" \
             --create-namespace \
             $VALUES_ARGS \
             --set cloud="${{ inputs.cloud }}" \
             --wait \
-            --atomic \
+            $ATOMIC \
             --timeout "${{ inputs.helm_timeout }}"
           REVISION=$(helm history "${{ inputs.service_name }}" -n "$NS" -o json | jq -r '.[-1].revision')
           echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
@@ -722,11 +732,20 @@ jobs:
             kubectl get secrets,configmaps -n "$NS"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          # Same content to the job log so it's greppable from the CLI.
+          # Same content to the job log so it's greppable from the CLI, plus
+          # container logs — the actual reason an app container crash-loops.
           kubectl get pods -n "$NS" -o wide
           kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -40
           kubectl describe externalsecrets -n "$NS" 2>/dev/null | tail -40
           kubectl get secrets,configmaps -n "$NS"
+          for POD in $(kubectl get pods -n "$NS" -l "app.kubernetes.io/name=${{ inputs.service_name }}" -o name 2>/dev/null); do
+            echo "══ logs $POD (current) ══"
+            kubectl logs "$POD" -n "$NS" -c "${{ inputs.service_name }}" --tail=80
+            echo "══ logs $POD (previous) ══"
+            kubectl logs "$POD" -n "$NS" -c "${{ inputs.service_name }}" --previous --tail=80
+            echo "══ describe $POD ══"
+            kubectl describe "$POD" -n "$NS" | tail -50
+          done
           exit 0
 
       - name: "🩺 Verify rollout"
