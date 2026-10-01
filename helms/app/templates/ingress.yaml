@@ -1,0 +1,66 @@
+{{- if .Values.service.internalDomain }}
+{{- /*
+  One Ingress per service, joining ONE load balancer per environment.
+
+  The service supplies a hostname and a port. Everything else — which load
+  balancer, which subnets, which security group, which DNS zone — belongs to
+  bootstrap, and reaches this template through values the deploy pipeline reads
+  from bootstrap's outputs. Adding a service must not add a load balancer.
+
+  Host is `<service>.<internalDomain>`, where internalDomain is the private
+  zone bootstrap created for this environment (on AWS that is
+  `<env>.<domain>`; on GCP and Azure each environment is its own
+  project/subscription, so the zone is the bare domain). external-dns writes
+  the record from this host, in every cloud.
+
+  Per cloud, the ingress class and annotations differ because the thing that
+  implements an Ingress differs:
+    aws   — AWS Load Balancer Controller; `group.name` merges every service's
+            Ingress into a single internal ALB.
+    gcp   — GKE's built-in controller, internal class, which gives a regional
+            internal Application Load Balancer.
+    azure — Application Gateway Ingress Controller, attached by bootstrap to
+            the Application Gateway it already creates.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.service.name }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: "{{ .Values.service.name }}.{{ .Values.service.internalDomain }}"
+    external-dns.alpha.kubernetes.io/ttl: "60"
+    {{- if eq .Values.cloud "aws" }}
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.ingress.healthcheckPath | quote }}
+    {{- /*
+      Every service in the environment shares this group, so the controller
+      keeps one ALB and adds a rule per host. The pipeline passes the group
+      name from bootstrap's `ingress_group_name` output; the fallback keeps a
+      chart rendered without it from silently creating its own balancer.
+    */}}
+    alb.ingress.kubernetes.io/group.name: {{ .Values.ingress.groupName | default (printf "%s-%s" .Values.service.namespace .Values.environment) | quote }}
+    {{- end }}
+    {{- if eq .Values.cloud "azure" }}
+    appgw.ingress.kubernetes.io/health-probe-path: {{ .Values.ingress.healthcheckPath | quote }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className | default (ternary "alb" (ternary "gce-internal" "azure-application-gateway" (eq .Values.cloud "gcp")) (eq .Values.cloud "aws")) }}
+  rules:
+    - host: "{{ .Values.service.name }}.{{ .Values.service.internalDomain }}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Values.service.name }}
+                port:
+                  number: {{ .Values.service.port }}
+{{- end }}
