@@ -285,24 +285,35 @@ jobs:
         run: |
           terraform output -json > /tmp/tf-outputs.json
 
-          # If VPN profile exists in S3, download and embed in outputs
+          # VPN client profiles are embedded in the outputs so the app can hand
+          # the user a file to download instead of an S3 path they then have to
+          # fetch with cloud credentials. One entry per protocol the project
+          # enabled; the profile is generated on the VPN host at first boot, so
+          # retry while cloud-init is still finishing.
           VPN_BUCKET=$(terraform output -raw vpn_profile_s3_bucket 2>/dev/null || echo "")
-          VPN_KEY=$(terraform output -raw vpn_profile_s3_key 2>/dev/null || echo "")
-          if [ -n "$VPN_BUCKET" ] && [ -n "$VPN_KEY" ]; then
-            echo "Downloading VPN profile from s3://$VPN_BUCKET/$VPN_KEY"
+
+          embed_profile() {
+            local key="$1" output_name="$2" tmp="/tmp/$output_name"
+            [ -z "$VPN_BUCKET" ] && return 0
+            [ -z "$key" ] && return 0
+            echo "Looking for s3://$VPN_BUCKET/$key"
             for i in 1 2 3 4 5; do
-              if aws s3 cp "s3://$VPN_BUCKET/$VPN_KEY" /tmp/vpn-profile.ovpn 2>/dev/null; then
-                OVPN_CONTENT=$(cat /tmp/vpn-profile.ovpn | jq -Rs .)
-                # Inject into outputs JSON
-                jq --arg content "$OVPN_CONTENT" '. + {"vpn_profile_ovpn": {"value": ($content | fromjson), "type": "string", "sensitive": false}}' /tmp/tf-outputs.json > /tmp/tf-outputs-tmp.json
+              if aws s3 cp "s3://$VPN_BUCKET/$key" "$tmp" 2>/dev/null; then
+                jq --rawfile content "$tmp" \
+                  ". + {\"$output_name\": {\"value\": \$content, \"type\": \"string\", \"sensitive\": true}}" \
+                  /tmp/tf-outputs.json > /tmp/tf-outputs-tmp.json
                 mv /tmp/tf-outputs-tmp.json /tmp/tf-outputs.json
-                echo "VPN profile embedded in outputs"
-                break
+                echo "Embedded $output_name ($(wc -c < "$tmp") bytes)"
+                return 0
               fi
-              echo "VPN profile not ready yet (attempt $i/5), waiting 30s..."
+              echo "$key not ready yet (attempt $i/5), waiting 30s..."
               sleep 30
             done
-          fi
+            echo "::warning title=VPN profile::$key never appeared in s3://$VPN_BUCKET — check /var/log/vpn-setup.log on the VPN host"
+          }
+
+          embed_profile "$(terraform output -raw vpn_profile_s3_key 2>/dev/null || echo "")" vpn_profile_openvpn
+          embed_profile "$(terraform output -raw vpn_wireguard_profile_s3_key 2>/dev/null || echo "")" vpn_profile_wireguard
 
       - name: "Upload terraform outputs"
         if: steps.apply.outcome == 'success' && inputs.action == 'apply'
