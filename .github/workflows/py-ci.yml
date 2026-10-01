@@ -472,9 +472,24 @@ jobs:
           case "${{ inputs.cloud }}" in
             aws)
               REGISTRY="${IMAGE_REPO%%/*}"
+              REPO_NAME="${IMAGE_REPO#*/}"
               echo "::notice title=🔑 ECR::logging in to $REGISTRY"
               aws ecr get-login-password --region "${{ inputs.region }}" \
                 | docker login --username AWS --password-stdin "$REGISTRY"
+              # ECR, unlike ACR and Artifact Registry, has no create-on-push:
+              # a missing repository fails the push with "name unknown". Create
+              # it here (idempotent) so a service's first deploy works without
+              # anyone pre-provisioning per-service registries.
+              if ! aws ecr describe-repositories \
+                    --repository-names "$REPO_NAME" \
+                    --region "${{ inputs.region }}" >/dev/null 2>&1; then
+                echo "::notice title=📦 ECR::creating repository $REPO_NAME"
+                aws ecr create-repository \
+                  --repository-name "$REPO_NAME" \
+                  --region "${{ inputs.region }}" \
+                  --image-scanning-configuration scanOnPush=true \
+                  --image-tag-mutability MUTABLE >/dev/null
+              fi
               ;;
             gcp)
               REGISTRY="${IMAGE_REPO%%/*}"
