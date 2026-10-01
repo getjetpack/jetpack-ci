@@ -52,12 +52,26 @@ serviceAccount:
   annotations: {}              # GCP WI:  iam.gke.io/gcp-service-account: <sa-email>
                                # AWS IRSA: eks.amazonaws.com/role-arn: <role-arn>
 
-# ── Ingress (off by default; bootstrap typically owns the shared LB) ────
+# ── Ingress (platform-owned) ─────────────────────────────────────────────
+# Exposure belongs to bootstrap: it installs the ingress controller and the DNS
+# controller, and these values arrive from its outputs via the deploy pipeline.
+# A service sets none of this.
+#
+# The Ingress renders whenever `service.internalDomain` is set — the same switch
+# that used to turn the Service into a LoadBalancer. There is no `enabled` flag
+# any more: a project with a private domain gets a host, one without gets
+# ClusterIP and in-cluster traffic only.
 ingress:
-  enabled: false
+  # IngressGroup / shared load balancer name. AWS merges every Ingress sharing a
+  # group into ONE ALB; passed from bootstrap's `ingress_group_name` output.
+  groupName: ""
+  # Overrides the per-cloud default class (alb / gce-internal /
+  # azure-application-gateway) when a project runs its own controller.
   className: ""
+  # The load balancer's own health check. Distinct from the pod probes: the LB
+  # needs a path that answers before it puts the target in service.
+  healthcheckPath: /health
   annotations: {}
-  hosts: []
   tls: []
 
 # ── Schema-driven env injection ─────────────────────────────────────────
