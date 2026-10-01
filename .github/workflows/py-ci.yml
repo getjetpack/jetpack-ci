@@ -694,6 +694,41 @@ jobs:
           URL="http://${{ inputs.service_name }}.$NS.svc.cluster.local"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
+      # `--atomic` rolls the release back, so by the time the step fails the
+      # pods are gone and the only evidence left is in the namespace: events,
+      # and the ExternalSecret/Secret the chart depends on. Without this a
+      # failed rollout reads as an opaque helm timeout.
+      - name: "🔍 Why the rollout failed"
+        if: failure() && steps.helm.outcome == 'failure'
+        env:
+          NS: ${{ steps.values.outputs.namespace_override || needs.init.outputs.namespace }}
+        run: |
+          set +e
+          {
+            echo "### 🔍 Rollout diagnostics (namespace \`$NS\`)"
+            echo ""
+            echo '```'
+            echo "── pods ──"
+            kubectl get pods -n "$NS" -o wide
+            echo ""
+            echo "── recent events ──"
+            kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -40
+            echo ""
+            echo "── externalsecrets ──"
+            kubectl get externalsecrets -n "$NS" 2>/dev/null
+            kubectl describe externalsecrets -n "$NS" 2>/dev/null | tail -40
+            echo ""
+            echo "── secrets / configmaps ──"
+            kubectl get secrets,configmaps -n "$NS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Same content to the job log so it's greppable from the CLI.
+          kubectl get pods -n "$NS" -o wide
+          kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -40
+          kubectl describe externalsecrets -n "$NS" 2>/dev/null | tail -40
+          kubectl get secrets,configmaps -n "$NS"
+          exit 0
+
       - name: "🩺 Verify rollout"
         env:
           NS: ${{ needs.init.outputs.namespace }}
