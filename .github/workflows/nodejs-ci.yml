@@ -76,7 +76,8 @@ on:
       helm_chart_override:            { description: "Optional. Path inside the service repo to a custom chart (wins over helm_type).", default: "", type: string }
       helm_values_file:               { description: "Optional extra values file inside the service repo (passed last so it wins over chart defaults).", default: "", type: string }
       namespace:                      { description: "K8s namespace — defaults to `domain` so all services in the same domain share a namespace", default: "", type: string }
-      internal_domain:                { description: "Private DNS domain (e.g. gcp.internal). When set, helm chart emits internal LoadBalancer + external-dns hostname so the service is reachable via VPN.", default: "", type: string }
+      internal_domain:                { description: "Private DNS ZONE this environment publishes into (e.g. dev.awsdemo.internal on AWS, gcp.internal on GCP). When set, the chart emits an Ingress with host <service>.<internal_domain> and external-dns writes the record. Empty leaves the service ClusterIP-only.", default: "", type: string }
+      ingress_group_name:             { description: "Shared load balancer the service's Ingress joins — bootstrap's `ingress_group_name` output. Every service in an environment shares one, so adding a service never adds a load balancer.", default: "", type: string }
       helm_timeout:                   { description: "Helm rollout timeout (e.g. 5m, 10m)",                               default: "5m", type: string }
 
       # ── 🟢 node ──────────────────────────────────────────────────────────
@@ -727,6 +728,7 @@ jobs:
             --create-namespace \
             $VALUES_ARGS \
             --set cloud="${{ inputs.cloud }}" \
+            --set ingress.groupName="${{ inputs.ingress_group_name }}" \
             --wait \
             $ATOMIC \
             --timeout "${{ inputs.helm_timeout }}"
