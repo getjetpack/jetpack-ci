@@ -713,6 +713,29 @@ jobs:
           if [ -n "$EXTRA_VALUES" ] && [ -f "$EXTRA_VALUES" ]; then
             VALUES_ARGS="$VALUES_ARGS --values $EXTRA_VALUES"
           fi
+          # A previous run that was cancelled (or hit the job timeout) mid-upgrade
+          # leaves the release in a pending-* state, and helm then refuses every
+          # later deploy with "another operation is in progress". Nothing clears
+          # it on its own, so recover before upgrading.
+          STATUS=$(helm status "${{ inputs.service_name }}" -n "$NS" -o json 2>/dev/null | jq -r '.info.status // empty')
+          case "$STATUS" in
+            pending-install)
+              echo "::warning title=🚀 Stuck release::previous install never completed — uninstalling before retry"
+              helm uninstall "${{ inputs.service_name }}" -n "$NS" --wait --timeout 2m || true
+              ;;
+            pending-upgrade|pending-rollback)
+              LAST=$(helm history "${{ inputs.service_name }}" -n "$NS" -o json 2>/dev/null \
+                | jq -r '[.[] | select(.status == "deployed")] | last | .revision // empty')
+              if [ -n "$LAST" ]; then
+                echo "::warning title=🚀 Stuck release::rolling back to revision $LAST before retry"
+                helm rollback "${{ inputs.service_name }}" "$LAST" -n "$NS" --wait --timeout 3m || true
+              else
+                echo "::warning title=🚀 Stuck release::no deployed revision to roll back to — uninstalling"
+                helm uninstall "${{ inputs.service_name }}" -n "$NS" --wait --timeout 2m || true
+              fi
+              ;;
+          esac
+
           # --atomic only makes sense when there IS a previous revision to roll
           # back to. On a first install it uninstalls everything instead,
           # deleting the crash-looping pods that explain the failure before
