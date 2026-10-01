@@ -1,0 +1,776 @@
+name: "🟢 Node.js Service CI/CD (Reusable)"
+
+# Cloud-agnostic 6-stage pipeline for Node.js services.
+#
+# Mirrors py-ci.yml stage for stage — same inputs, same cloud auth, same
+# backend/ECR handling, same diagnostics — so a project with services in both
+# languages has one pipeline contract, not two.
+#
+#   🎬 init   →  🔨 build  →  🧪 test  →  🏗️ infra  →  📦 release  →  🚀 deploy
+#                  └────────────┘            (skipped if no TF changes)
+#
+# Same workflow handles AWS, GCP, and Azure — the cloud is an input and
+# auth/registry/kubeconfig are gated by `case` switches. Each job exposes
+# outputs so downstream jobs can pick them up via `needs.<job>.outputs.X`.
+#
+# Image path convention (constructed inside this workflow):
+#
+#   image_repo = {image_registry}/{organization}/{project_name}/{domain}/{service_name}
+#   image_full = {image_repo}:{tag}
+#
+# That layout works for all clouds:
+#   AWS  ECR:  123456789.dkr.ecr.us-west-2.amazonaws.com/testa/gcp/users/user-service
+#   GCP  AR :  us-west2-docker.pkg.dev/testa/gcp/users/user-service
+#   Azure ACR: acrname.azurecr.io/testa/gcp/users/user-service
+#
+# Pass `image_repo_override` (a fully-qualified repo URL, no tag) to bypass
+# the convention entirely — useful for legacy registries or shared images.
+#
+# Caller example:
+#
+#   jobs:
+#     deploy:
+#       uses: getjetpack/jetpack-ci/.github/workflows/nodejs-ci.yml@main
+#       with:
+#         cloud: gcp
+#         organization: testa
+#         project_name: gcp
+#         domain: users           # service domain — comes from service config
+#         service_name: user-service
+#         env: dev
+#         region: us-west2
+#         image_registry: us-west2-docker.pkg.dev
+#         cluster_name: gcp-dev
+#         cluster_location: us-west2-a
+#         gcp_workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+#         gcp_service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+on:
+  workflow_call:
+    inputs:
+      # ── 🏷️ identity ──────────────────────────────────────────────────────
+      organization:                   { description: "Jetpack org slug — first path segment of the image repo (e.g. testa)", required: true, type: string }
+      project_name:                   { description: "Jetpack project slug (e.g. gcp)",                                    required: true, type: string }
+      domain:                         { description: "Service domain — groups related services (e.g. users, orders)",     required: true, type: string }
+      service_name:                   { description: "Service slug — last path segment of the image repo (e.g. user-svc)", required: true, type: string }
+      env:                            { description: "dev | staging | prod",                                              required: true, type: string }
+      region:                         { description: "Cloud region for both image registry and runtime",                  required: true, type: string }
+
+      # ── ☁️ cloud ─────────────────────────────────────────────────────────
+      cloud:                          { description: "aws | gcp | azure",                                                 required: true, type: string }
+      aws_role_arn:                   { description: "AWS only — IAM role ARN assumed via OIDC",                          default: "", type: string }
+      gcp_workload_identity_provider: { description: "GCP only — Workload Identity provider resource name",               default: "", type: string }
+      gcp_service_account:            { description: "GCP only — deploy service account email",                           default: "", type: string }
+      azure_client_id:                { description: "Azure only — federated client ID",                                  default: "", type: string }
+      azure_tenant_id:                { description: "Azure only — tenant ID",                                            default: "", type: string }
+      azure_subscription_id:          { description: "Azure only — subscription ID",                                      default: "", type: string }
+
+      # ── 🐳 container ─────────────────────────────────────────────────────
+      image_registry:                 { description: "Registry host (e.g. us-west2-docker.pkg.dev, 123.dkr.ecr.us-west-2.amazonaws.com, acr.azurecr.io)", required: true, type: string }
+      image_repo_override:            { description: "Override the {registry}/{org}/{project}/{domain}/{service} convention with a fully-qualified repo URL (no tag).", default: "", type: string }
+
+      # ── ⚓ cluster ──────────────────────────────────────────────────────
+      cluster_name:                   { description: "Target Kubernetes cluster name",                                    required: true, type: string }
+      cluster_location:               { description: "Region/zone for k8s (EKS/GKE) or resource group (AKS)",             required: true, type: string }
+      helm_type:                      { description: "Chart from getjetpack/jetpack-ci/helms/<type>: app | job",          default: "app", type: string }
+      helm_chart_override:            { description: "Optional. Path inside the service repo to a custom chart (wins over helm_type).", default: "", type: string }
+      helm_values_file:               { description: "Optional extra values file inside the service repo (passed last so it wins over chart defaults).", default: "", type: string }
+      namespace:                      { description: "K8s namespace — defaults to `domain` so all services in the same domain share a namespace", default: "", type: string }
+      internal_domain:                { description: "Private DNS domain (e.g. gcp.internal). When set, helm chart emits internal LoadBalancer + external-dns hostname so the service is reachable via VPN.", default: "", type: string }
+      helm_timeout:                   { description: "Helm rollout timeout (e.g. 5m, 10m)",                               default: "5m", type: string }
+
+      # ── 🟢 node ──────────────────────────────────────────────────────────
+      node_version:                   { description: "Node version for setup-node",                                      default: "20",   type: string }
+      run_tests:                      { description: "Run `npm test` in the test job",                                   default: true,   type: boolean }
+
+      # ── 🏗️ terraform (service infra) ────────────────────────────────────
+      tf_dir:                         { description: "Per-service Terraform directory — apply only runs if files here changed", default: "./infra", type: string }
+      tf_state_bucket:                { description: "AWS/GCP state bucket owned by bootstrap. Jetpack names it {resource_prefix}-{env}-tfstate, which can't be derived from the account/project id — pass it explicitly. Empty falls back to the legacy {account_id}-tfstate / {gcp_project}-tfstate guess.", default: "", type: string }
+      tf_state_storage_account:       { description: "Azure only — state storage account owned by bootstrap. Empty falls back to {project_name}{env}tfst.", default: "", type: string }
+      tf_state_resource_group:        { description: "Azure only — resource group holding the state account. Empty falls back to {project_name}-tfstate-rg.", default: "", type: string }
+
+      # ── 🔐 secrets schema (.env.example) ────────────────────────────────
+      env_schema_file:                { description: ".env.example file driving ConfigMap + ExternalSecret generation. Set to '' to disable.", default: ".env.example", type: string }
+      secret_store_default:           { description: "ClusterSecretStore name for ${secret:…} entries — usually the cloud's native Secret Manager", default: "cloud-default",  type: string }
+      param_store_default:            { description: "ClusterSecretStore name for ${param:…} entries — Parameter Store or equivalent",           default: "param-default",  type: string }
+      vault_store_default:            { description: "ClusterSecretStore name for ${vault:…} entries — HashiCorp Vault",                         default: "vault-default",  type: string }
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ─── 🎬 INIT ────────────────────────────────────────────────────────────
+  init:
+    name: "🎬 Init"
+    runs-on: ubuntu-latest
+    outputs:
+      image_repo:       ${{ steps.repo.outputs.repo }}
+      image_tag:        ${{ steps.tag.outputs.tag }}
+      image_full:       ${{ steps.tag.outputs.full }}
+      namespace:        ${{ steps.ctx.outputs.namespace }}
+      has_tf_changes:   ${{ steps.tf_changes.outputs.changed }}
+      node_version:     ${{ inputs.node_version }}
+      sha_short:        ${{ steps.tag.outputs.sha_short }}
+    steps:
+      - name: "🛎️ Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # need previous commit for diff
+
+      - name: "🧩 Compose image_repo"
+        id: repo
+        run: |
+          # Convention: {registry}/{org}/{project}/{domain}/{service}
+          # The override input wins when provided (legacy registries, shared repos).
+          if [ -n "${{ inputs.image_repo_override }}" ]; then
+            REPO="${{ inputs.image_repo_override }}"
+            echo "::notice title=🧩 Repo override::using ${REPO}"
+          else
+            REPO="${{ inputs.image_registry }}/${{ inputs.organization }}/${{ inputs.project_name }}/${{ inputs.domain }}/${{ inputs.service_name }}"
+            echo "::notice title=🧩 Image repo composed::${REPO}"
+          fi
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+
+      - name: "🏷️ Resolve image tag"
+        id: tag
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          STAMP=$(date -u +%Y%m%d-%H%M)
+          TAG="${SHORT_SHA}-${STAMP}"
+          REPO="${{ steps.repo.outputs.repo }}"
+          {
+            echo "tag=${TAG}"
+            echo "sha_short=${SHORT_SHA}"
+            echo "full=${REPO}:${TAG}"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice title=🏷️ Image tag::${REPO}:${TAG}"
+
+      - name: "📦 Context"
+        id: ctx
+        run: |
+          # Namespace defaults to the service `domain` — services in the same
+          # domain (e.g. users → user-svc + auth-svc + profile-svc) end up in
+          # one namespace and can talk via short service names.
+          NS="${{ inputs.namespace }}"
+          if [ -z "$NS" ]; then NS="${{ inputs.domain }}"; fi
+          echo "namespace=$NS" >> "$GITHUB_OUTPUT"
+          echo "::notice title=📦 Namespace::$NS"
+
+      - name: "🔎 Detect Terraform changes under ${{ inputs.tf_dir }}"
+        id: tf_changes
+        run: |
+          # Normalize `tf_dir` — strip leading "./" and trailing "/" so both
+          # `./infra` and `.scripts/tf` and `infra/` all collapse to the same
+          # form that matches git diff output.
+          TF_DIR_NORM="$(echo "${{ inputs.tf_dir }}" | sed -e 's|^\./||' -e 's|/$||')"
+          # If the dir doesn't exist, infra job is skipped outright.
+          if [ ! -d "$TF_DIR_NORM" ] && [ ! -d "./$TF_DIR_NORM" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=🔎 TF dir missing::no service infra to apply (looked in $TF_DIR_NORM)"
+            exit 0
+          fi
+          # Manual dispatch → always run infra (operator explicitly triggered).
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=🔎 workflow_dispatch::running infra apply unconditionally"
+            exit 0
+          fi
+          # First commit (no HEAD~1) → treat as changed so initial apply runs.
+          if ! git rev-parse HEAD~1 >/dev/null 2>&1; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=🔎 First commit::running infra apply"
+            exit 0
+          fi
+          if git diff --name-only HEAD~1 HEAD | grep -qE "^${TF_DIR_NORM}/"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=✅ TF changes detected::infra job will run"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=⏭️ No TF changes::infra job will be skipped"
+          fi
+
+      - name: "📋 Init summary"
+        run: |
+          {
+            echo "### 🎬 Init"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| 🏷️ Image tag | \`${{ steps.tag.outputs.tag }}\` |"
+            echo "| 📦 Namespace | \`${{ steps.ctx.outputs.namespace }}\` |"
+            echo "| 🏗️ Terraform changes | \`${{ steps.tf_changes.outputs.changed }}\` |"
+            echo "| ☁️ Cloud | \`${{ inputs.cloud }}\` |"
+            echo "| 🌍 Region | \`${{ inputs.region }}\` |"
+            echo "| 🎯 Env | \`${{ inputs.env }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─── 🔨 BUILD ───────────────────────────────────────────────────────────
+  build:
+    name: "🔨 Build"
+    needs: init
+    runs-on: ubuntu-latest
+    outputs:
+      built:           "true"
+      image_full:      ${{ needs.init.outputs.image_full }}
+    steps:
+      - name: "🛎️ Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🟢 Setup Node ${{ needs.init.outputs.node_version }}"
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ needs.init.outputs.node_version }}
+          cache: "npm"
+
+      - name: "📥 Install dependencies"
+        run: |
+          # `npm ci` needs a lockfile; a freshly scaffolded service has none
+          # until someone commits one, so fall back rather than fail the build.
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: "🔧 Type-check / build"
+        run: |
+          # The TypeScript build is the real gate here — a type error must fail
+          # the pipeline before an image is built, not after it is deployed.
+          npm run build --if-present
+
+      - name: "🔍 Lint (optional)"
+        continue-on-error: true
+        run: npm run lint --if-present
+
+      - name: "🐳 Setup Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "🏗️ Build container image (no push)"
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ needs.init.outputs.image_full }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: "📋 Build summary"
+        run: |
+          echo "### 🔨 Build" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ Image built: \`${{ needs.init.outputs.image_full }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ─── 🧪 TEST ────────────────────────────────────────────────────────────
+  test:
+    name: "🧪 Test"
+    needs: init
+    if: inputs.run_tests
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.run.outputs.result }}
+    steps:
+      - name: "🛎️ Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🟢 Setup Node"
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ needs.init.outputs.node_version }}
+          cache: "npm"
+
+      - name: "📥 Install dependencies"
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: "🧪 Run tests"
+        id: run
+        run: |
+          # A `test` script that is just a placeholder ("no test specified")
+          # exits 1 on purpose — treat that as "no tests" rather than a failure.
+          if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)" 2>/dev/null; then
+            npm test
+            echo "result=passed" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning title=🧪 No tests::no test script in package.json — skipping"
+            echo "result=skipped" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "📋 Test summary"
+        if: always()
+        run: |
+          echo "### 🧪 Test" >> "$GITHUB_STEP_SUMMARY"
+          echo "Result: \`${{ steps.run.outputs.result }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ─── 🏗️ INFRA (skipped when no TF changes) ──────────────────────────────
+  infra:
+    name: "🏗️ Infra"
+    needs: init
+    if: needs.init.outputs.has_tf_changes == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      applied:       "true"
+      tf_outputs:    ${{ steps.tf.outputs.outputs_b64 }}
+    steps:
+      - name: "🛎️ Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🔐 Authenticate to AWS (OIDC)"
+        if: inputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region:     ${{ inputs.region }}
+
+      - name: "🔐 Authenticate to GCP (WIF)"
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+          service_account:            ${{ inputs.gcp_service_account }}
+
+      - name: "🔐 Authenticate to Azure (OIDC)"
+        if: inputs.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ inputs.azure_client_id }}
+          tenant-id:       ${{ inputs.azure_tenant_id }}
+          subscription-id: ${{ inputs.azure_subscription_id }}
+
+      - name: "🔧 Setup Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: "🏗️ Terraform init + apply"
+        id: tf
+        working-directory: ${{ inputs.tf_dir }}
+        env:
+          TF_VAR_image_tag: ${{ needs.init.outputs.image_tag }}
+          # Azure: OIDC auth for the azurerm provider AND backend. Ignored on
+          # AWS/GCP (no azurerm), so safe to set unconditionally.
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ inputs.azure_client_id }}
+          ARM_TENANT_ID: ${{ inputs.azure_tenant_id }}
+          ARM_SUBSCRIPTION_ID: ${{ inputs.azure_subscription_id }}
+        run: |
+          VARFILE="env/${{ inputs.env }}/${{ inputs.region }}.tfvars"
+          if [ ! -f "$VARFILE" ]; then
+            echo "::error title=🏗️ Terraform::Missing $VARFILE — regenerate the service to emit it."
+            exit 1
+          fi
+
+          # ── Backend config per cloud ────────────────────────────────
+          # State bucket convention (owned by bootstrap):
+          #   GCP:   {gcp_project_id}-tfstate
+          #   AWS:   {aws_account_id}-tfstate         (via caller identity)
+          #   Azure: RG {project}-tfstate-rg, SA {project}{env}tfst, container tfstate
+          # Prefix/key scopes per (env, region, service) so services in the same
+          # env can't stomp each other.
+          BACKEND_ARGS=""
+          case "${{ inputs.cloud }}" in
+            gcp)
+              BUCKET="${{ inputs.tf_state_bucket }}"
+              [ -n "$BUCKET" ] || BUCKET="${CLOUDSDK_CORE_PROJECT:-$(gcloud config get-value project 2>/dev/null)}-tfstate"
+              PREFIX="services/${{ inputs.service_name }}/${{ inputs.env }}/${{ inputs.region }}"
+              BACKEND_ARGS="-backend-config=bucket=$BUCKET -backend-config=prefix=$PREFIX"
+              echo "::notice title=🏗️ Backend::gcs bucket=$BUCKET prefix=$PREFIX"
+              ;;
+            aws)
+              # Bootstrap owns the bucket and names it {resource_prefix}-{env}-tfstate,
+              # which is NOT derivable from the account id — the caller passes it.
+              # Fall back to the legacy account-id guess only when it's absent.
+              BUCKET="${{ inputs.tf_state_bucket }}"
+              if [ -z "$BUCKET" ]; then
+                ACCT=$(aws sts get-caller-identity --query Account --output text)
+                BUCKET="${ACCT}-tfstate"
+              fi
+              KEY="services/${{ inputs.service_name }}/${{ inputs.env }}/${{ inputs.region }}/terraform.tfstate"
+              BACKEND_ARGS="-backend-config=bucket=$BUCKET -backend-config=key=$KEY -backend-config=region=${{ inputs.region }}"
+              echo "::notice title=🏗️ Backend::s3 bucket=$BUCKET key=$KEY"
+              ;;
+            azure)
+              # Reuse the bootstrap-owned state account (created by the bootstrap
+              # workflow's "Ensure tfstate storage exists" step) — same RG / SA /
+              # container naming, with a service-scoped key.
+              RG="${{ inputs.tf_state_resource_group }}"
+              [ -n "$RG" ] || RG="${{ inputs.project_name }}-tfstate-rg"
+              SA="${{ inputs.tf_state_storage_account }}"
+              [ -n "$SA" ] || SA=$(echo "${{ inputs.project_name }}${{ inputs.env }}tfst" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-24)
+              KEY="services/${{ inputs.service_name }}/${{ inputs.env }}/${{ inputs.region }}.tfstate"
+              BACKEND_ARGS="-backend-config=resource_group_name=$RG -backend-config=storage_account_name=$SA -backend-config=container_name=tfstate -backend-config=key=$KEY"
+              echo "::notice title=🏗️ Backend::azurerm sa=$SA container=tfstate key=$KEY"
+              ;;
+          esac
+
+          echo "::notice title=🏗️ Terraform::initialising"
+          terraform init $BACKEND_ARGS
+          echo "::notice title=🏗️ Terraform::applying with $VARFILE"
+          terraform apply -auto-approve -var-file="$VARFILE"
+          # Capture outputs as a base64 blob — downstream deploy job can pull
+          # values from it via `jq` without us inventing per-output args.
+          OUTPUTS_B64=$(terraform output -json | base64 -w0)
+          echo "outputs_b64=$OUTPUTS_B64" >> "$GITHUB_OUTPUT"
+
+      - name: "📋 Infra summary"
+        env:
+          # `terraform output` re-reads the backend; give it the same Azure OIDC
+          # creds as init+apply so azurerm doesn't fall back to az-CLI auth
+          # (unsupported for a service principal). Ignored on AWS/GCP.
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ inputs.azure_client_id }}
+          ARM_TENANT_ID: ${{ inputs.azure_tenant_id }}
+          ARM_SUBSCRIPTION_ID: ${{ inputs.azure_subscription_id }}
+        run: |
+          {
+            echo "### 🏗️ Infra"
+            echo "✅ Applied service infra at \`${{ inputs.tf_dir }}\`"
+            echo ""
+            echo "<details><summary>Outputs</summary>"
+            echo ""
+            echo '```json'
+            cd ${{ inputs.tf_dir }} && terraform output -json
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─── 📦 RELEASE (push image) ────────────────────────────────────────────
+  release:
+    name: "📦 Release"
+    needs: [init, build, test, infra]
+    # Allow test + infra to be skipped (when run_tests=false / no TF changes)
+    # but never failed. A failing infra job stops the pipeline here — no
+    # image gets pushed, no deploy tries to fetch missing secrets, no helm
+    # timeout masks the real error.
+    if: |
+      always()
+      && needs.build.result == 'success'
+      && (needs.test.result == 'success' || needs.test.result == 'skipped')
+      && (needs.infra.result == 'success' || needs.infra.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      image_full:      ${{ needs.init.outputs.image_full }}
+      image_digest:    ${{ steps.push.outputs.digest }}
+    steps:
+      - name: "🛎️ Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🔐 Authenticate to AWS (OIDC)"
+        if: inputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region:     ${{ inputs.region }}
+
+      - name: "🔐 Authenticate to GCP (WIF)"
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+          service_account:            ${{ inputs.gcp_service_account }}
+
+      - name: "☁️ Setup gcloud"
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          # GKE auth via kubectl / helm needs the auth-plugin since k8s
+          # 1.26+ removed the in-tree gcp auth provider. Installs the
+          # binary the kubeconfig produced by `get-credentials` invokes.
+          install_components: gke-gcloud-auth-plugin
+
+      - name: "🔐 Authenticate to Azure (OIDC)"
+        if: inputs.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ inputs.azure_client_id }}
+          tenant-id:       ${{ inputs.azure_tenant_id }}
+          subscription-id: ${{ inputs.azure_subscription_id }}
+
+      - name: "🔑 Registry login (cloud-aware)"
+        env:
+          IMAGE_REPO: ${{ needs.init.outputs.image_repo }}
+        run: |
+          case "${{ inputs.cloud }}" in
+            aws)
+              REGISTRY="${IMAGE_REPO%%/*}"
+              REPO_NAME="${IMAGE_REPO#*/}"
+              echo "::notice title=🔑 ECR::logging in to $REGISTRY"
+              aws ecr get-login-password --region "${{ inputs.region }}" \
+                | docker login --username AWS --password-stdin "$REGISTRY"
+              # ECR, unlike ACR and Artifact Registry, has no create-on-push:
+              # a missing repository fails the push with "name unknown". Create
+              # it here (idempotent) so a service's first deploy works without
+              # anyone pre-provisioning per-service registries.
+              if ! aws ecr describe-repositories \
+                    --repository-names "$REPO_NAME" \
+                    --region "${{ inputs.region }}" >/dev/null 2>&1; then
+                echo "::notice title=📦 ECR::creating repository $REPO_NAME"
+                aws ecr create-repository \
+                  --repository-name "$REPO_NAME" \
+                  --region "${{ inputs.region }}" \
+                  --image-scanning-configuration scanOnPush=true \
+                  --image-tag-mutability MUTABLE >/dev/null
+              fi
+              ;;
+            gcp)
+              REGISTRY="${IMAGE_REPO%%/*}"
+              echo "::notice title=🔑 Artifact Registry::logging in to $REGISTRY"
+              gcloud auth configure-docker "$REGISTRY" --quiet
+              ;;
+            azure)
+              REGISTRY="${IMAGE_REPO%%/*}"
+              echo "::notice title=🔑 ACR::logging in to ${REGISTRY%%.*}"
+              az acr login --name "${REGISTRY%%.*}"
+              ;;
+            *)
+              echo "::error::Unknown cloud '${{ inputs.cloud }}'"; exit 1 ;;
+          esac
+
+      - name: "🐳 Setup Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "📦 Build + push"
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ needs.init.outputs.image_full }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: "📋 Release summary"
+        run: |
+          {
+            echo "### 📦 Release"
+            echo "✅ Pushed: \`${{ needs.init.outputs.image_full }}\`"
+            echo "🔢 Digest: \`${{ steps.push.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─── 🚀 DEPLOY ──────────────────────────────────────────────────────────
+  deploy:
+    name: "🚀 Deploy"
+    needs: [init, release, infra]
+    # infra may be skipped when no TF changes — allow that.
+    if: |
+      always()
+      && needs.release.result == 'success'
+      && (needs.infra.result == 'success' || needs.infra.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      url:             ${{ steps.helm.outputs.url }}
+      revision:        ${{ steps.helm.outputs.revision }}
+      deployed_image:  ${{ needs.release.outputs.image_full }}
+    steps:
+      - name: "🛎️ Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🔐 Authenticate to AWS (OIDC)"
+        if: inputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region:     ${{ inputs.region }}
+
+      - name: "🔐 Authenticate to GCP (WIF)"
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.gcp_workload_identity_provider }}
+          service_account:            ${{ inputs.gcp_service_account }}
+
+      - name: "☁️ Setup gcloud"
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          # GKE auth via kubectl / helm needs the auth-plugin since k8s
+          # 1.26+ removed the in-tree gcp auth provider. Installs the
+          # binary the kubeconfig produced by `get-credentials` invokes.
+          install_components: gke-gcloud-auth-plugin
+
+      - name: "🔐 Authenticate to Azure (OIDC)"
+        if: inputs.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ inputs.azure_client_id }}
+          tenant-id:       ${{ inputs.azure_tenant_id }}
+          subscription-id: ${{ inputs.azure_subscription_id }}
+
+      - name: "🧭 Update kubeconfig (cloud-aware)"
+        run: |
+          case "${{ inputs.cloud }}" in
+            aws)
+              echo "::notice title=🧭 EKS::updating kubeconfig"
+              aws eks update-kubeconfig \
+                --name "${{ inputs.cluster_name }}" \
+                --region "${{ inputs.region }}"
+              ;;
+            gcp)
+              echo "::notice title=🧭 GKE::updating kubeconfig"
+              gcloud container clusters get-credentials \
+                "${{ inputs.cluster_name }}" \
+                --location "${{ inputs.cluster_location }}"
+              ;;
+            azure)
+              echo "::notice title=🧭 AKS::updating kubeconfig"
+              # AKS lives in the bootstrap resource group {project}-{env}-rg
+              # (not cluster_location, which is a region/zone concept).
+              az aks get-credentials \
+                --name "${{ inputs.cluster_name }}" \
+                --resource-group "${{ inputs.project_name }}-${{ inputs.env }}-rg" \
+                --overwrite-existing
+              ;;
+          esac
+          kubectl config current-context
+
+      - name: "📝 Compose helm values"
+        id: values
+        uses: getjetpack/jetpack-ci/.github/actions/parse-env-schema@main
+        with:
+          organization:     ${{ inputs.organization }}
+          project_name:     ${{ inputs.project_name }}
+          domain:           ${{ inputs.domain }}
+          service_name:     ${{ inputs.service_name }}
+          env:              ${{ inputs.env }}
+          cloud:            ${{ inputs.cloud }}
+          schema_file:      ${{ inputs.env_schema_file }}
+          image_repository: ${{ needs.init.outputs.image_repo }}
+          image_tag:        ${{ needs.init.outputs.image_tag }}
+          secret_store:     ${{ inputs.secret_store_default }}
+          param_store:      ${{ inputs.param_store_default }}
+          vault_store:      ${{ inputs.vault_store_default }}
+          internal_domain:  ${{ inputs.internal_domain }}
+
+      - name: "📚 Checkout helm charts library"
+        if: inputs.helm_chart_override == ''
+        uses: actions/checkout@v4
+        with:
+          repository: getjetpack/jetpack-ci
+          ref: main
+          path: .jetpack-ci-charts
+          sparse-checkout: helms
+          sparse-checkout-cone-mode: false
+
+      - name: "⚓ Setup Helm"
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.14.0"
+
+      - name: "🧭 Resolve chart path"
+        id: chart
+        run: |
+          if [ -n "${{ inputs.helm_chart_override }}" ]; then
+            PATH_OUT="${{ inputs.helm_chart_override }}"
+            echo "::notice title=📚 Chart::override → $PATH_OUT"
+          else
+            PATH_OUT=".jetpack-ci-charts/helms/${{ inputs.helm_type }}"
+            echo "::notice title=📚 Chart::library → $PATH_OUT"
+          fi
+          if [ ! -f "$PATH_OUT/Chart.yaml" ]; then
+            echo "::error title=📚 Chart not found::no Chart.yaml at $PATH_OUT"
+            exit 1
+          fi
+          echo "path=$PATH_OUT" >> "$GITHUB_OUTPUT"
+
+      - name: "🚀 helm upgrade --install"
+        id: helm
+        env:
+          # K8S_OVERRIDE_NAMESPACE in .env.example wins; otherwise the init
+          # job's default (env or domain) is used.
+          NS:           ${{ steps.values.outputs.namespace_override || needs.init.outputs.namespace }}
+          VALUES_FILE:  ${{ steps.values.outputs.values_file }}
+          CHART_PATH:   ${{ steps.chart.outputs.path }}
+          EXTRA_VALUES: ${{ inputs.helm_values_file }}
+        run: |
+          # Single composed values file from the compose-helm-values action
+          # carries identity (service.name, image.repository/tag, environment,
+          # replicaCount) + schema-derived envLiterals/envParams/envSecrets.
+          # Layer caller's extras file on top (wins over chart defaults).
+          VALUES_ARGS="--values $VALUES_FILE"
+          if [ -n "$EXTRA_VALUES" ] && [ -f "$EXTRA_VALUES" ]; then
+            VALUES_ARGS="$VALUES_ARGS --values $EXTRA_VALUES"
+          fi
+          # --atomic only makes sense when there IS a previous revision to roll
+          # back to. On a first install it uninstalls everything instead,
+          # deleting the crash-looping pods that explain the failure before
+          # anyone can read their logs.
+          ATOMIC=""
+          if helm status "${{ inputs.service_name }}" -n "$NS" >/dev/null 2>&1; then
+            ATOMIC="--atomic"
+          else
+            echo "::notice title=🚀 First install::skipping --atomic so a failed rollout stays inspectable"
+          fi
+          helm upgrade --install "${{ inputs.service_name }}" "$CHART_PATH" \
+            --namespace "$NS" \
+            --create-namespace \
+            $VALUES_ARGS \
+            --set cloud="${{ inputs.cloud }}" \
+            --wait \
+            $ATOMIC \
+            --timeout "${{ inputs.helm_timeout }}"
+          REVISION=$(helm history "${{ inputs.service_name }}" -n "$NS" -o json | jq -r '.[-1].revision')
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+          # Best-effort service URL (cluster-internal — caller can override)
+          URL="http://${{ inputs.service_name }}.$NS.svc.cluster.local"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      # `--atomic` rolls the release back, so by the time the step fails the
+      # pods are gone and the only evidence left is in the namespace: events,
+      # and the ExternalSecret/Secret the chart depends on. Without this a
+      # failed rollout reads as an opaque helm timeout.
+      - name: "🔍 Why the rollout failed"
+        if: failure() && steps.helm.outcome == 'failure'
+        env:
+          NS: ${{ steps.values.outputs.namespace_override || needs.init.outputs.namespace }}
+        run: |
+          set +e
+          {
+            echo "### 🔍 Rollout diagnostics (namespace \`$NS\`)"
+            echo ""
+            echo '```'
+            echo "── pods ──"
+            kubectl get pods -n "$NS" -o wide
+            echo ""
+            echo "── recent events ──"
+            kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -40
+            echo ""
+            echo "── externalsecrets ──"
+            kubectl get externalsecrets -n "$NS" 2>/dev/null
+            kubectl describe externalsecrets -n "$NS" 2>/dev/null | tail -40
+            echo ""
+            echo "── secrets / configmaps ──"
+            kubectl get secrets,configmaps -n "$NS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Same content to the job log so it's greppable from the CLI, plus
+          # container logs — the actual reason an app container crash-loops.
+          kubectl get pods -n "$NS" -o wide
+          kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -40
+          kubectl describe externalsecrets -n "$NS" 2>/dev/null | tail -40
+          kubectl get secrets,configmaps -n "$NS"
+          for POD in $(kubectl get pods -n "$NS" -l "app.kubernetes.io/name=${{ inputs.service_name }}" -o name 2>/dev/null); do
+            echo "══ logs $POD (current) ══"
+            kubectl logs "$POD" -n "$NS" -c "${{ inputs.service_name }}" --tail=80
+            echo "══ logs $POD (previous) ══"
+            kubectl logs "$POD" -n "$NS" -c "${{ inputs.service_name }}" --previous --tail=80
+            echo "══ describe $POD ══"
+            kubectl describe "$POD" -n "$NS" | tail -50
+          done
+          exit 0
+
+      - name: "🩺 Verify rollout"
+        env:
+          NS: ${{ needs.init.outputs.namespace }}
+        run: |
+          kubectl -n "$NS" rollout status "deploy/${{ inputs.service_name }}" --timeout="${{ inputs.helm_timeout }}"
+          kubectl -n "$NS" get pods -l "app.kubernetes.io/name=${{ inputs.service_name }}"
+
+      - name: "📋 Deploy summary"
+        run: |
+          {
+            echo "### 🚀 Deploy"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| ☁️ Cloud | \`${{ inputs.cloud }}\` |"
+            echo "| 🎡 Cluster | \`${{ inputs.cluster_name }}\` @ \`${{ inputs.cluster_location }}\` |"
+            echo "| 📦 Image | \`${{ needs.init.outputs.image_full }}\` |"
+            echo "| 📍 Namespace | \`${{ needs.init.outputs.namespace }}\` |"
+            echo "| 🔢 Helm revision | \`${{ steps.helm.outputs.revision }}\` |"
+            echo "| 🌐 In-cluster URL | \`${{ steps.helm.outputs.url }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
